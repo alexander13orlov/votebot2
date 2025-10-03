@@ -1,0 +1,14 @@
+# bot/config.py
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # загружает переменные из .env
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("Не найден BOT_TOKEN в .env")
+# список ID админов (строками или числами)
+ADMIN_IDS = [
+    "84324980",   # твой id
+    "123456789",  # ещё админ
+]

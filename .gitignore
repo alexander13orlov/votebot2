@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+settings.json
+polls_state.json
