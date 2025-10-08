@@ -2,7 +2,10 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, time, date
+from datetime import datetime, timedelta, time, date, timezone
+from dateutil import parser
+LOCAL_TZ = timezone(timedelta(hours=3))  # локальный часовой пояс (UTC+3)
+
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -13,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from .config import BOT_TOKEN  # оставлено как есть (config.py в пакете bot)
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent
@@ -32,7 +35,7 @@ active_poll: Dict[int, Dict[str, Any]] = {}
 
 # Для предотвращения повторного автозапуска одного и того же расписания в один день
 last_autocreate: Dict[tuple, date] = {}
-
+last_autodeactivate = {}
 # История — список последних опросов (новейшие в начале)
 history: List[Dict[str, Any]] = []
 
@@ -362,52 +365,79 @@ async def autopoll_scheduler():
     logger.info("Autopoll scheduler started")
     while True:
         try:
-            now = datetime.utcnow()
-            # Если уже есть активный опрос — пропускаем все автозапуски
-            if active_poll:
-                # также проверяем истечение времени активного опроса
-                for cid, info in list(active_poll.items()):
-                    if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_local = now_utc.astimezone(LOCAL_TZ)
+            logger.debug(f"[autopoll] Tick at {now_local.isoformat()} (weekday={now_local.strftime('%a').lower()[:3]})")
+
+            # Проверка и деактивация активных опросов
+            for cid, info in list(active_poll.items()):
+                expires_at = info.get("expires_at")
+                if expires_at:
+                    # Приводим expires_at к timezone-aware, если нужно
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=LOCAL_TZ)
+                    key_deact = (cid,)
+                    already_deact = last_autodeactivate.get(key_deact)
+                    if now_local >= expires_at and already_deact != date.today():
+                        logger.info(f"[autopoll] Deactivating poll {cid} due to expiration")
                         await deactivate_poll(cid, reason="expired by scheduler")
+                        last_autodeactivate[key_deact] = date.today()
+
+            # Если уже есть активный опрос, пропускаем создание новых
+            if active_poll:
                 await asyncio.sleep(30)
                 continue
 
+            # Проходим по чатам и командам
             for chat_id_str, chat_conf in SETTINGS["chats"].items():
                 chat_id = int(chat_id_str)
                 topics = chat_conf.get("topics", {})
                 topic = topics.get("root", {})
                 commands = topic.get("commands", {})
+
                 for cmd_name, cmd_conf in commands.items():
                     if cmd_conf.get("autopoll", "false").lower() != "true":
                         continue
+
                     aps = cmd_conf.get("autopollsettings", {})
                     schedule_list = aps.get("schedule_autopoll", [])
+
                     for sched in schedule_list:
                         day = sched.get("day", "").strip().lower()[:3]
                         create_time = parse_time_str(sched.get("createmsg"))
-                        today_weekday = now.strftime("%a").lower()[:3]
+                        today_weekday = now_local.strftime("%a").lower()[:3]
+
                         if day != today_weekday:
                             continue
-                        sched_dt = datetime.combine(date.today(), create_time)
+
+                        sched_dt = datetime.combine(date.today(), create_time).replace(tzinfo=LOCAL_TZ)
                         key = (chat_id, cmd_name, day, sched.get("createmsg"))
                         already = last_autocreate.get(key)
-                        # выполняем запуск, если текущее время в пределах 60 секунд от sched_dt
-                        if sched_dt <= now < (sched_dt + timedelta(seconds=60)):
+
+                        logger.debug(
+                            f"[autopoll] Check schedule: cmd={cmd_name}, day={day}, target={sched.get('createmsg')}, "
+                            f"today={today_weekday}, sched_dt={sched_dt.isoformat()}, now_local={now_local.isoformat()}"
+                        )
+
+                        # Проверяем окно запуска (60 секунд)
+                        if sched_dt <= now_local < (sched_dt + timedelta(seconds=60)):
                             if already == date.today():
+                                logger.debug(f"[autopoll] Already executed today for {cmd_name}")
                                 continue
-                            # если уже есть активный опрос — пропускаем (на всякий случай)
                             if active_poll:
+                                logger.debug(f"[autopoll] Active poll exists, skip creating new {cmd_name}")
                                 last_autocreate[key] = date.today()
                                 continue
+
+                            logger.info(f"[autopoll] Triggering scheduled autopoll for {cmd_name} (chat {chat_id})")
                             await create_poll(chat_id, cmd_name, by_auto=True, schedule_entry=sched)
                             last_autocreate[key] = date.today()
-            # проверка сроков жизни активного опроса
-            for cid, info in list(active_poll.items()):
-                if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
-                    await deactivate_poll(cid, reason="expired by scheduler")
+
         except Exception as e:
             logger.exception("Error in autopoll scheduler: %s", e)
+
         await asyncio.sleep(30)
+
 
 
 async def main():
