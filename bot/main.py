@@ -1,201 +1,286 @@
+# -*- coding: utf-8 -*-
+import asyncio
 import json
 import logging
-import asyncio
+from datetime import datetime, timedelta, time, date
 from pathlib import Path
-from telegram import Update, Poll
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    PollAnswerHandler,
-    PollHandler,
-)
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.exceptions import TelegramBadRequest
+
 from .config import BOT_TOKEN
 
-# Пути
-BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_FILE = BASE_DIR / "settings.json"
-POLLS_STATE_FILE = BASE_DIR / "polls_state.json"
-
-# Логирование
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-# Глобальные переменные
-settings = {}
-polls_data = {}  # poll_id -> {chat_id, message_id, answers, options, voters}
+DATA_DIR = Path(__file__).parent
+SETTINGS_PATH = DATA_DIR / "settings.json"
+
+with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+    SETTINGS = json.load(f)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+active_poll = {}
+last_autocreate = {}
 
 
-def load_settings():
-    global settings
-    with open(SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
-        settings = json.load(f)
-    logger.info("Настройки загружены")
+def parse_time_str(t: str) -> time:
+    h, m, s = [int(x) for x in t.split(":")]
+    return time(hour=h, minute=m, second=s)
 
 
-async def save_polls_state():
-    """Сохраняем состояние опросов в файл"""
+def user_display_name(user: types.User) -> str:
+    if user.username:
+        return f"@{user.username} ({user.full_name})"
+    return f"{user.full_name}"
+
+
+async def edit_poll_message_old(chat_id: int, message_id: int, question: str, participants):
+    lines = [question, ""]
+    if participants:
+        for idx, p in enumerate(participants, start=1):
+            uid, username, fullname = p
+            if username:
+                # lines.append(f"{idx}. @{username} — {fullname}")
+                lines.append(f"{idx}. @{username}")
+            else:
+                lines.append(f"{idx}. {fullname}")
+    else:
+        lines.append("Пока нет участников.")
+    text = "\n".join(lines)
     try:
-        with open(POLLS_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(polls_data, f, ensure_ascii=False, indent=2)
-        logger.info("Polls state saved.")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения состояния опросов: {e}")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+    except TelegramBadRequest:
+        pass
 
-
-async def send_current_results(context: ContextTypes.DEFAULT_TYPE, poll_id: str):
-    """Формируем и обновляем сообщение с текущими результатами"""
-    if poll_id not in polls_data:
-        return
-
-    pdata = polls_data[poll_id]
-    chat_id = pdata["chat_id"]
-    msg_id = pdata["results_message_id"]
-    options = pdata["options"]
-    answers = pdata["answers"]
-
-    total_voters = sum(len(voters) for voters in answers.values())
-
-    lines = []
-    for idx, option in enumerate(options):
-        voters = answers.get(idx, [])
-        lines.append(f"[{len(voters)}/{total_voters}] {option}")
-        if voters:
-            lines.extend(voters)
-
-    text = "\n".join(lines) if lines else "Нет голосов."
-
+async def edit_poll_message(chat_id: int, message_id: int, question: str, participants):
+    total = len(participants)
+    lines = [f"[{total}]", question, ""]
+    if participants:
+        for idx, p in enumerate(participants, start=1):
+            uid, username, fullname = p
+            if username:
+                # lines.append(f"{idx}. @{username} — {fullname}")
+                lines.append(f"@{username}")
+            else:
+                lines.append(f"{fullname}")
+    else:
+        lines.append("Пока нет участников.")
+    text = "\n".join(lines)
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=text
-        )
-    except Exception as e:
-        logger.warning(f"Не удалось обновить сообщение с результатами: {e}")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+    except TelegramBadRequest:
+        pass
 
 
-async def handle_poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, conf: dict):
-    """Обработка команды, запускающей опрос"""
-    logger.info(f"Запущена команда /{cmd} пользователем @{update.effective_user.username}")
 
-    poll_settings = conf.get("settings", {})
-    question = poll_settings.get("question", "Вопрос?")
-    options = poll_settings.get("options", ["Да", "Нет"])
-    is_anonymous = poll_settings.get("is_anonymous", False)
-    allows_multiple_answers = poll_settings.get("allows_multiple_answers", False)
+def find_command_settings(chat_id: int, command_name: str):
+    chat_conf = SETTINGS["chats"].get(str(chat_id))
+    if not chat_conf:
+        return None
+    topics = chat_conf.get("topics", {})
+    topic = topics.get("root", {})
+    commands = topic.get("commands", {})
+    return commands.get(command_name)
 
-    # Отправляем опрос без цитирования
-    poll_message = await context.bot.send_poll(
-        chat_id=update.effective_chat.id,
-        question=question,
-        options=options,
-        is_anonymous=is_anonymous,
-        allows_multiple_answers=allows_multiple_answers
-    )
 
-    poll_id = poll_message.poll.id
-    polls_data[poll_id] = {
-        "chat_id": poll_message.chat_id,
-        "message_id": poll_message.message_id,
-        "results_message_id": None,
-        "options": options,
-        "answers": {},
+async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedule_entry: Optional[dict] = None):
+    if chat_id in active_poll:
+        logger.info("Active poll exists in chat %s, skipping creation of %s", chat_id, command_name)
+        return None
+
+    cmd_settings = find_command_settings(chat_id, command_name)
+    if not cmd_settings:
+        return None
+
+    question = cmd_settings.get("question", f"Опрос: {command_name}")
+
+    pinned = False
+    unpin = False
+    if by_auto:
+        aps = cmd_settings.get("autopollsettings", {})
+        pin = aps.get("pin", "false").lower() == "true"
+        unpin = aps.get("unpin", "false").lower() == "true"
+        deactivatemsg = schedule_entry.get("deactivatemsg")
+        deact_time = parse_time_str(deactivatemsg)
+        today = date.today()
+        expires_at = datetime.combine(today, deact_time)
+    else:
+        mps = cmd_settings.get("manualpollsettings", {})
+        pin = mps.get("pin", "false").lower() == "true"
+        unpin = mps.get("unpin", "false").lower() == "true"
+        ttl_minutes = int(mps.get("timetolife", 480))  # теперь значение в минутах, по умолчанию 480 мин = 8 часов
+        expires_at = datetime.utcnow() + timedelta(minutes=ttl_minutes)
+
+
+    text = f"{question}\n\nПока нет участников."
+    sent = await bot.send_message(chat_id, text)
+    message_id = sent.message_id
+
+    if pin:
+        try:
+            await bot.pin_chat_message(chat_id, message_id)
+            pinned = True
+        except Exception as e:
+            logger.warning("Pin failed: %s", e)
+
+    active_poll[chat_id] = {
+        "command": command_name,
+        "message_id": message_id,
+        "expires_at": expires_at,
+        "pinned": pinned,
+        "participants": [],
+        "unpin": unpin,
     }
 
-    # Если нужно сразу показывать результаты
-    if conf.get("currentresult", False):
-        # Отправляем сообщение без цитирования
-        result_msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Результаты будут обновляться здесь..."
-        )
-        polls_data[poll_id]["results_message_id"] = result_msg.message_id
-
-        # Первое обновление
-        await send_current_results(context, poll_id)
+    logger.info("Created poll %s in chat %s, expires at %s", command_name, chat_id, expires_at.isoformat())
+    return active_poll[chat_id]
 
 
-async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обновление данных при голосовании"""
-    answer = update.poll_answer
-    poll_id = answer.poll_id
-    user = f"@{answer.user.username}" if answer.user.username else answer.user.first_name
+async def deactivate_poll(chat_id: int, reason="manual"):
+    info = active_poll.get(chat_id)
+    if not info:
+        return False
+    message_id = info["message_id"]
+    pinned = info.get("pinned", False)
+    unpin = info.get("unpin", False)
+    if pinned and unpin:
+        try:
+            await bot.unpin_chat_message(chat_id=str(chat_id), message_id=message_id)
+        except Exception as e:
+            logger.warning("Unpin failed: %s", e)
 
-    if poll_id not in polls_data:
+    question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
+    participants = info["participants"]
+    lines = [f"{question} (ЗАКРЫТ)", ""]
+    if participants:
+        for idx, p in enumerate(participants, start=1):
+            uid, username, fullname = p
+            if username:
+                lines.append(f"{idx}. @{username} — {fullname}")
+            else:
+                lines.append(f"{idx}. {fullname}")
+    else:
+        lines.append("Никто не записался.")
+    try:
+        await bot.edit_message_text("\n".join(lines), chat_id, message_id)
+    except Exception:
+        pass
+
+    del active_poll[chat_id]
+    logger.info("Deactivated poll in %s (%s)", chat_id, reason)
+    return True
+
+
+# --- Handlers --- #
+
+# Команды сабля
+@dp.message(Command(commands=["saber"]))
+async def saber_cmd(message: Message):
+    chat_id = message.chat.id
+    await create_poll(chat_id, "saber")
+    # await message.reply("Создан опрос: сабля")
+
+
+# Команды рапира
+@dp.message(Command(commands=["rapier"]))
+async def rapier_cmd(message: Message):
+    chat_id = message.chat.id
+    await create_poll(chat_id, "rapier")
+    # await message.reply("Создан опрос: рапира")
+
+
+# Деактивация
+@dp.message(Command(commands=["deactivate"]))
+async def deactivate_cmd(message: Message):
+    chat_id = message.chat.id
+    res = await deactivate_poll(chat_id)
+    if res:
+        await message.reply("Активный опрос деактивирован.")
+    else:
+        await message.reply("Активных опросов нет.")
+
+
+# Плюс/минус для записи/удаления
+@dp.message(F.text.in_({"+", "-"}))
+async def plus_minus_handler(message: Message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    info = active_poll.get(chat_id)
+    if not info:
         return
-
-    pdata = polls_data[poll_id]
-
-    # Удаляем юзера из всех вариантов
-    for voters in pdata["answers"].values():
-        if user in voters:
-            voters.remove(user)
-
-    # Добавляем голос
-    for option_id in answer.option_ids:
-        pdata["answers"].setdefault(option_id, []).append(user)
-
-    # Обновляем сообщение с результатами
-    if pdata.get("results_message_id"):
-        await send_current_results(context, poll_id)
-
-
-async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка закрытия опроса"""
-    poll = update.poll
-    if not poll.is_closed:
+    if datetime.utcnow() >= info["expires_at"]:
+        await deactivate_poll(chat_id, reason="expired")
         return
-    if poll.id in polls_data:
-        logger.info(f"Опрос {poll.id} закрыт")
-        polls_data.pop(poll.id)
+    uid = message.from_user.id
+    username = message.from_user.username
+    fullname = message.from_user.full_name
+    participants = info["participants"]
+
+    if text == "+":
+        if not any(p[0] == uid for p in participants):
+            participants.append((uid, username, fullname))
+            # await message.reply("Вы добавлены в список.")
+            cmd_settings = find_command_settings(chat_id, info["command"])
+            await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
+    else:
+        if any(p[0] == uid for p in participants):
+            participants[:] = [p for p in participants if p[0] != uid]
+            # await message.reply("Вы удалены из списка.")
+            cmd_settings = find_command_settings(chat_id, info["command"])
+            await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
 
 
-async def get_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для получения настроек"""
-    user_id = str(update.effective_user.id)
-    chat_id = str(update.effective_chat.id)
+async def autopoll_scheduler():
+    logger.info("Autopoll scheduler started")
+    while True:
+        try:
+            now = datetime.utcnow()
+            for chat_id_str, chat_conf in SETTINGS["chats"].items():
+                chat_id = int(chat_id_str)
+                topics = chat_conf.get("topics", {})
+                topic = topics.get("root", {})
+                commands = topic.get("commands", {})
+                for cmd_name, cmd_conf in commands.items():
+                    if cmd_conf.get("autopoll", "false").lower() != "true":
+                        continue
+                    aps = cmd_conf.get("autopollsettings", {})
+                    schedule_list = aps.get("schedule_autopoll", [])
+                    for sched in schedule_list:
+                        day = sched.get("day", "").strip().lower()[:3]
+                        create_time = parse_time_str(sched.get("createmsg"))
+                        today_weekday = now.strftime("%a").lower()[:3]
+                        if day != today_weekday:
+                            continue
+                        sched_dt = datetime.combine(date.today(), create_time)
+                        key = (chat_id, cmd_name, day, sched.get("createmsg"))
+                        already = last_autocreate.get(key)
+                        if sched_dt <= now < (sched_dt + timedelta(seconds=60)):
+                            if already == date.today():
+                                continue
+                            if chat_id in active_poll:
+                                last_autocreate[key] = date.today()
+                                continue
+                            await create_poll(chat_id, cmd_name, by_auto=True, schedule_entry=sched)
+                            last_autocreate[key] = date.today()
+            for cid, info in list(active_poll.items()):
+                if datetime.utcnow() >= info["expires_at"]:
+                    await deactivate_poll(cid, reason="expired")
+        except Exception as e:
+            logger.exception("Error in autopoll scheduler: %s", e)
+        await asyncio.sleep(30)
 
-    admins = settings["chats"].get(chat_id, {}).get("admins", [])
-    if user_id not in admins:
-        await context.bot.send_message(chat_id=chat_id, text="Только админы могут получить файл настроек.")
-        return
 
-    await context.bot.send_document(chat_id=chat_id, document=SETTINGS_FILE)
-
-
-def register_dynamic_commands(app: Application):
-    """Регистрируем команды из settings.json"""
-    for chat_id, chat_conf in settings.get("chats", {}).items():
-        for topic, tconf in chat_conf.get("topics", {}).items():
-            for cmd, conf in tconf.get("commands", {}).items():
-                app.add_handler(CommandHandler(cmd, lambda u, c, cm=cmd, cf=conf: handle_poll_command(u, c, cm, cf)))
-                logger.info(f"Зарегистрирована команда /{cmd}")
-
-
-def main():
-    load_settings()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Базовые команды
-    app.add_handler(CommandHandler("getsettings", get_settings))
-
-    # Обработчики опросов
-    app.add_handler(PollAnswerHandler(poll_answer_handler))
-    app.add_handler(PollHandler(poll_handler))
-
-    # Динамические команды
-    register_dynamic_commands(app)
-
-    # Периодическое сохранение
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(save_polls_state()), interval=30, first=30)
-
-    logger.info("Бот запущен")
-    app.run_polling()
+async def main():
+    asyncio.create_task(autopoll_scheduler())
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
