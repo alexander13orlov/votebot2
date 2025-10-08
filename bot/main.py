@@ -4,21 +4,21 @@ import json
 import logging
 from datetime import datetime, timedelta, time, date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.exceptions import TelegramBadRequest
 
-from .config import BOT_TOKEN
+from .config import BOT_TOKEN  # оставлено как есть (config.py в пакете bot)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent
 SETTINGS_PATH = DATA_DIR / "settings.json"
+HISTORY_PATH = DATA_DIR / "polls_history.json"  # файл для хранения последних 100 опросов
 
 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
     SETTINGS = json.load(f)
@@ -26,8 +26,15 @@ with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-active_poll = {}
-last_autocreate = {}
+# В памяти — активный опрос на каждом чате (поддерживается не больше одного активного опроса глобально)
+# active_poll: { chat_id: { "command": str, "message_id": int, "expires_at": datetime, "pinned": bool, "unpin": bool, "participants": [ (uid, username, fullname), ... ] } }
+active_poll: Dict[int, Dict[str, Any]] = {}
+
+# Для предотвращения повторного автозапуска одного и того же расписания в один день
+last_autocreate: Dict[tuple, date] = {}
+
+# История — список последних опросов (новейшие в начале)
+history: List[Dict[str, Any]] = []
 
 
 def parse_time_str(t: str) -> time:
@@ -41,32 +48,88 @@ def user_display_name(user: types.User) -> str:
     return f"{user.full_name}"
 
 
-async def edit_poll_message_old(chat_id: int, message_id: int, question: str, participants):
-    lines = [question, ""]
-    if participants:
-        for idx, p in enumerate(participants, start=1):
-            uid, username, fullname = p
-            if username:
-                # lines.append(f"{idx}. @{username} — {fullname}")
-                lines.append(f"{idx}. @{username}")
-            else:
-                lines.append(f"{idx}. {fullname}")
-    else:
-        lines.append("Пока нет участников.")
-    text = "\n".join(lines)
-    try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-    except TelegramBadRequest:
-        pass
+def _serialize_participants(participants: List[tuple]) -> List[Dict[str, Any]]:
+    return [{"uid": p[0], "username": p[1], "fullname": p[2]} for p in participants]
 
-async def edit_poll_message(chat_id: int, message_id: int, question: str, participants):
+
+def _deserialize_participants(data: List[Dict[str, Any]]) -> List[tuple]:
+    return [(d["uid"], d.get("username"), d.get("fullname")) for d in data]
+
+
+def load_history():
+    global history, active_poll
+    if HISTORY_PATH.exists():
+        try:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+            # Найдём активные записи и восстановим только последнюю активную (восстанавливаем только один активный)
+            active_entries = [h for h in history if h.get("active")]
+            if active_entries:
+                # возьмём наиболее позднюю по created_at
+                active_entries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+                entry = active_entries[0]
+                chat_id = int(entry["chat_id"])
+                # Восстановим в active_poll
+                active_poll.clear()  # гарантируем, что только одна активная запись
+                active_poll[chat_id] = {
+                    "command": entry["command"],
+                    "message_id": int(entry["message_id"]),
+                    "expires_at": datetime.fromisoformat(entry["expires_at"]) if entry.get("expires_at") else None,
+                    "pinned": bool(entry.get("pinned", False)),
+                    "unpin": bool(entry.get("unpin", False)),
+                    "participants": _deserialize_participants(entry.get("participants", [])),
+                }
+                logger.info("Restored active poll from history: chat=%s message=%s command=%s",
+                            chat_id, entry["message_id"], entry["command"])
+            else:
+                active_poll.clear()
+        except Exception as e:
+            logger.exception("Failed to load history: %s", e)
+            history = []
+            active_poll.clear()
+    else:
+        history = []
+        active_poll.clear()
+
+
+def save_history():
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history[:100], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Failed to save history: %s", e)
+
+
+def add_history_entry(entry: Dict[str, Any]):
+    """
+    Добавляет новую запись в историю (в начало списка), держит максимум 100 элементов.
+    """
+    history.insert(0, entry)
+    # Обрезаем до 100
+    if len(history) > 100:
+        del history[100:]
+    save_history()
+
+
+def update_history_entry(chat_id: int, message_id: int, **updates):
+    """
+    Находит запись по chat_id и message_id и обновляет её полями updates.
+    """
+    for h in history:
+        if int(h.get("chat_id")) == int(chat_id) and int(h.get("message_id")) == int(message_id):
+            h.update(updates)
+            save_history()
+            return
+    # если не найдено — ничего не делаем
+
+
+async def edit_poll_message(chat_id: int, message_id: int, question: str, participants: List[tuple]):
     total = len(participants)
     lines = [f"[{total}]", question, ""]
     if participants:
-        for idx, p in enumerate(participants, start=1):
+        for p in participants:
             uid, username, fullname = p
             if username:
-                # lines.append(f"{idx}. @{username} — {fullname}")
                 lines.append(f"@{username}")
             else:
                 lines.append(f"{fullname}")
@@ -75,12 +138,11 @@ async def edit_poll_message(chat_id: int, message_id: int, question: str, partic
     text = "\n".join(lines)
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-    except TelegramBadRequest:
-        pass
+    except TelegramBadRequest as e:
+        logger.warning("Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e)
 
 
-
-def find_command_settings(chat_id: int, command_name: str):
+def find_command_settings(chat_id: int, command_name: str) -> Optional[dict]:
     chat_conf = SETTINGS["chats"].get(str(chat_id))
     if not chat_conf:
         return None
@@ -91,12 +153,14 @@ def find_command_settings(chat_id: int, command_name: str):
 
 
 async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedule_entry: Optional[dict] = None):
-    if chat_id in active_poll:
-        logger.info("Active poll exists in chat %s, skipping creation of %s", chat_id, command_name)
+    # Если есть активный опрос в любом чате — пропускаем (требование: максимум один активный глобально)
+    if active_poll:
+        logger.info("There is already an active poll, skipping creation of %s", command_name)
         return None
 
     cmd_settings = find_command_settings(chat_id, command_name)
     if not cmd_settings:
+        logger.info("Command settings not found for %s in chat %s", command_name, chat_id)
         return None
 
     question = cmd_settings.get("question", f"Опрос: {command_name}")
@@ -115,10 +179,11 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         mps = cmd_settings.get("manualpollsettings", {})
         pin = mps.get("pin", "false").lower() == "true"
         unpin = mps.get("unpin", "false").lower() == "true"
-        ttl_minutes = int(mps.get("timetolife", 480))  # теперь значение в минутах, по умолчанию 480 мин = 8 часов
+        # timetolife хранится в минутaх в config — если это часы прежде, нужно менять в config
+        ttl_minutes = int(mps.get("timetolife", 480))
         expires_at = datetime.utcnow() + timedelta(minutes=ttl_minutes)
 
-
+    # Создаём СОВСЕМ НОВОЕ сообщение (никогда не переиспользуем старое)
     text = f"{question}\n\nПока нет участников."
     sent = await bot.send_message(chat_id, text)
     message_id = sent.message_id
@@ -130,6 +195,8 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         except Exception as e:
             logger.warning("Pin failed: %s", e)
 
+    # Запомним активный опрос в памяти
+    active_poll.clear()
     active_poll[chat_id] = {
         "command": command_name,
         "message_id": message_id,
@@ -137,27 +204,50 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         "pinned": pinned,
         "participants": [],
         "unpin": unpin,
+        "created_at": datetime.utcnow().isoformat(),
     }
 
-    logger.info("Created poll %s in chat %s, expires at %s", command_name, chat_id, expires_at.isoformat())
+    # Добавим запись в историю (active=True)
+    entry = {
+        "chat_id": str(chat_id),
+        "message_id": str(message_id),
+        "command": command_name,
+        "participants": _serialize_participants([]),
+        "created_at": active_poll[chat_id]["created_at"],
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "active": True,
+        "pinned": pinned,
+        "unpin": unpin,
+    }
+    add_history_entry(entry)
+
+    logger.info("Created poll %s in chat %s, message_id=%s expires_at=%s", command_name, chat_id, message_id, expires_at.isoformat())
     return active_poll[chat_id]
 
 
 async def deactivate_poll(chat_id: int, reason="manual"):
-    info = active_poll.get(chat_id)
+    info = None
+    # Найдём активный опрос в этом чате (если он активен)
+    if chat_id in active_poll:
+        info = active_poll[chat_id]
     if not info:
+        logger.info("No active poll in chat %s to deactivate", chat_id)
         return False
+
     message_id = info["message_id"]
     pinned = info.get("pinned", False)
     unpin = info.get("unpin", False)
+
+    # Открепляем если нужно (передаём chat_id как строку, чтобы избежать ошибок типов)
     if pinned and unpin:
         try:
             await bot.unpin_chat_message(chat_id=str(chat_id), message_id=message_id)
         except Exception as e:
             logger.warning("Unpin failed: %s", e)
 
+    # Построим итоговый текст с пометкой "ЗАКРЫТ"
     question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
-    participants = info["participants"]
+    participants = info.get("participants", [])
     lines = [f"{question} (ЗАКРЫТ)", ""]
     if participants:
         for idx, p in enumerate(participants, start=1):
@@ -170,9 +260,13 @@ async def deactivate_poll(chat_id: int, reason="manual"):
         lines.append("Никто не записался.")
     try:
         await bot.edit_message_text("\n".join(lines), chat_id, message_id)
-    except Exception:
-        pass
+    except TelegramBadRequest:
+        logger.warning("Failed to edit message when closing poll chat=%s message=%s", chat_id, message_id)
 
+    # Обновим историю: пометим соответствующую запись как active=False и сохраним финальный список участников
+    update_history_entry(chat_id, message_id, active=False, participants=_serialize_participants(participants))
+
+    # Удалим активный опрос из памяти — после деактивации он не должен более использоваться
     del active_poll[chat_id]
     logger.info("Deactivated poll in %s (%s)", chat_id, reason)
     return True
@@ -180,34 +274,28 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
 # --- Handlers --- #
 
-# Команды сабля
 @dp.message(Command(commands=["saber"]))
 async def saber_cmd(message: Message):
     chat_id = message.chat.id
     await create_poll(chat_id, "saber")
-    # await message.reply("Создан опрос: сабля")
 
 
-# Команды рапира
 @dp.message(Command(commands=["rapier"]))
 async def rapier_cmd(message: Message):
     chat_id = message.chat.id
     await create_poll(chat_id, "rapier")
-    # await message.reply("Создан опрос: рапира")
 
 
-# Деактивация
 @dp.message(Command(commands=["deactivate"]))
 async def deactivate_cmd(message: Message):
     chat_id = message.chat.id
-    res = await deactivate_poll(chat_id)
+    res = await deactivate_poll(chat_id, reason=f"manual by {message.from_user.id}")
     if res:
         await message.reply("Активный опрос деактивирован.")
     else:
         await message.reply("Активных опросов нет.")
 
 
-# Плюс/минус для записи/удаления
 @dp.message(F.text.in_({"+", "-"}))
 async def plus_minus_handler(message: Message):
     chat_id = message.chat.id
@@ -215,7 +303,8 @@ async def plus_minus_handler(message: Message):
     info = active_poll.get(chat_id)
     if not info:
         return
-    if datetime.utcnow() >= info["expires_at"]:
+    # проверяем expiry
+    if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
         await deactivate_poll(chat_id, reason="expired")
         return
     uid = message.from_user.id
@@ -226,15 +315,17 @@ async def plus_minus_handler(message: Message):
     if text == "+":
         if not any(p[0] == uid for p in participants):
             participants.append((uid, username, fullname))
-            # await message.reply("Вы добавлены в список.")
+            # обновляем сообщение
             cmd_settings = find_command_settings(chat_id, info["command"])
             await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
-    else:
+            # Обновим историю с новым списком участников
+            update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
+    else:  # "-"
         if any(p[0] == uid for p in participants):
             participants[:] = [p for p in participants if p[0] != uid]
-            # await message.reply("Вы удалены из списка.")
             cmd_settings = find_command_settings(chat_id, info["command"])
             await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
+            update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
 
 async def autopoll_scheduler():
@@ -242,6 +333,15 @@ async def autopoll_scheduler():
     while True:
         try:
             now = datetime.utcnow()
+            # Если уже есть активный опрос — пропускаем все автозапуски
+            if active_poll:
+                # также проверяем истечение времени активного опроса
+                for cid, info in list(active_poll.items()):
+                    if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
+                        await deactivate_poll(cid, reason="expired by scheduler")
+                await asyncio.sleep(30)
+                continue
+
             for chat_id_str, chat_conf in SETTINGS["chats"].items():
                 chat_id = int(chat_id_str)
                 topics = chat_conf.get("topics", {})
@@ -261,24 +361,31 @@ async def autopoll_scheduler():
                         sched_dt = datetime.combine(date.today(), create_time)
                         key = (chat_id, cmd_name, day, sched.get("createmsg"))
                         already = last_autocreate.get(key)
+                        # выполняем запуск, если текущее время в пределах 60 секунд от sched_dt
                         if sched_dt <= now < (sched_dt + timedelta(seconds=60)):
                             if already == date.today():
                                 continue
-                            if chat_id in active_poll:
+                            # если уже есть активный опрос — пропускаем (на всякий случай)
+                            if active_poll:
                                 last_autocreate[key] = date.today()
                                 continue
                             await create_poll(chat_id, cmd_name, by_auto=True, schedule_entry=sched)
                             last_autocreate[key] = date.today()
+            # проверка сроков жизни активного опроса
             for cid, info in list(active_poll.items()):
-                if datetime.utcnow() >= info["expires_at"]:
-                    await deactivate_poll(cid, reason="expired")
+                if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
+                    await deactivate_poll(cid, reason="expired by scheduler")
         except Exception as e:
             logger.exception("Error in autopoll scheduler: %s", e)
         await asyncio.sleep(30)
 
 
 async def main():
+    # Загрузим историю и восстановим (если есть) активный опрос
+    load_history()
+    # Запустим автопланировщик
     asyncio.create_task(autopoll_scheduler())
+    # Запуск Polling
     await dp.start_polling(bot)
 
 
