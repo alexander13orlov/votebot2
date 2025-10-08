@@ -1,7 +1,7 @@
 [
   {
     "chat_id": "-1001570728084",
-    "message_id": "2196",
+    "message_id": "2244",
     "command": "saber",
     "participants": [
       {
@@ -10,10 +10,55 @@
         "fullname": "Alexey"
       }
     ],
-    "created_at": "2025-10-08T20:55:53.077138",
-    "expires_at": "2025-10-09T04:55:52.656122",
+    "created_at": "2025-10-08T21:15:46.245992",
+    "expires_at": "2025-10-09T05:15:45.962916",
     "active": true,
     "pinned": true,
+    "unpin": true
+  },
+  {
+    "chat_id": "-1001570728084",
+    "message_id": "2233",
+    "command": "saber",
+    "participants": [
+      {
+        "uid": 84324980,
+        "username": "lex13orlov",
+        "fullname": "Alexey"
+      }
+    ],
+    "created_at": "2025-10-08T21:14:44.142668",
+    "expires_at": "2025-10-09T05:14:43.899168",
+    "active": false,
+    "pinned": false,
+    "unpin": true
+  },
+  {
+    "chat_id": "-1001570728084",
+    "message_id": "2226",
+    "command": "rapier",
+    "participants": [],
+    "created_at": "2025-10-08T21:14:22.923834",
+    "expires_at": "2025-10-09T05:14:22.660593",
+    "active": false,
+    "pinned": false,
+    "unpin": true
+  },
+  {
+    "chat_id": "-1001570728084",
+    "message_id": "2217",
+    "command": "saber",
+    "participants": [
+      {
+        "uid": 84324980,
+        "username": "lex13orlov",
+        "fullname": "Alexey"
+      }
+    ],
+    "created_at": "2025-10-08T21:13:49.935336",
+    "expires_at": "2025-10-09T05:13:49.421474",
+    "active": false,
+    "pinned": false,
     "unpin": true
   }
 ]

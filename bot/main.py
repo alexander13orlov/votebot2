@@ -96,6 +96,7 @@ def save_history():
     try:
         with open(HISTORY_PATH, "w", encoding="utf-8") as f:
             json.dump(history[:100], f, ensure_ascii=False, indent=2)
+        logger.info("Saved history: %d entries -> %s", len(history[:100]), HISTORY_PATH)
     except Exception as e:
         logger.exception("Failed to save history: %s", e)
 
@@ -114,13 +115,25 @@ def add_history_entry(entry: Dict[str, Any]):
 def update_history_entry(chat_id: int, message_id: int, **updates):
     """
     Находит запись по chat_id и message_id и обновляет её полями updates.
+    Если не найдено — логируем предупреждение.
     """
+    found = False
     for h in history:
-        if int(h.get("chat_id")) == int(chat_id) and int(h.get("message_id")) == int(message_id):
-            h.update(updates)
-            save_history()
-            return
-    # если не найдено — ничего не делаем
+        try:
+            if int(h.get("chat_id")) == int(chat_id) and int(h.get("message_id")) == int(message_id):
+                h.update(updates)
+                found = True
+                break
+        except Exception:
+            # если в данных что-то необычное — пропускаем запись
+            continue
+
+    if found:
+        save_history()
+        logger.info("Updated history entry: chat=%s message=%s updates=%s", chat_id, message_id, list(updates.keys()))
+    else:
+        logger.warning("History entry not found for update: chat=%s message=%s updates=%s", chat_id, message_id, updates)
+
 
 
 async def edit_poll_message(chat_id: int, message_id: int, question: str, participants: List[tuple]):
@@ -226,10 +239,7 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
 
 
 async def deactivate_poll(chat_id: int, reason="manual"):
-    info = None
-    # Найдём активный опрос в этом чате (если он активен)
-    if chat_id in active_poll:
-        info = active_poll[chat_id]
+    info = active_poll.get(chat_id)
     if not info:
         logger.info("No active poll in chat %s to deactivate", chat_id)
         return False
@@ -238,10 +248,14 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     pinned = info.get("pinned", False)
     unpin = info.get("unpin", False)
 
-    # Открепляем если нужно (передаём chat_id как строку, чтобы избежать ошибок типов)
+    unpin_success = False
+    # Попытка открепить, если это нужно
     if pinned and unpin:
         try:
             await bot.unpin_chat_message(chat_id=str(chat_id), message_id=message_id)
+            unpin_success = True
+            info["pinned"] = False
+            logger.info("Successfully unpinned message %s in chat %s", message_id, chat_id)
         except Exception as e:
             logger.warning("Unpin failed: %s", e)
 
@@ -258,19 +272,35 @@ async def deactivate_poll(chat_id: int, reason="manual"):
                 lines.append(f"{idx}. {fullname}")
     else:
         lines.append("Никто не записался.")
-    try:
-        await bot.edit_message_text("\n".join(lines), chat_id, message_id)
-    except TelegramBadRequest:
-        logger.warning("Failed to edit message when closing poll chat=%s message=%s", chat_id, message_id)
 
-    # Обновим историю: пометим соответствующую запись как active=False и сохраним финальный список участников
-    update_history_entry(chat_id, message_id, active=False, participants=_serialize_participants(participants))
+    # Пытаемся обновить текст сообщения (именованные аргументы + chat_id как строка)
+    try:
+        await bot.edit_message_text(text="\n".join(lines), chat_id=str(chat_id), message_id=message_id)
+        edit_ok = True
+    except Exception as e:
+        edit_ok = False
+        logger.warning("Failed to edit message when closing poll chat=%s message=%s: %s", chat_id, message_id, e)
+
+    # Решаем финальное значение pinned в истории: если we successfully unpinned -> False, иначе сохраняем текущее info['pinned']
+    pinned_value = False if unpin_success else bool(info.get("pinned", False))
+
+    # Обновим историю: пометим запись как inactive и установим pinned_value и финальный список участников
+    update_history_entry(chat_id, message_id,
+                         active=False,
+                         pinned=pinned_value,
+                         participants=_serialize_participants(participants))
+
+    logger.info("History updated for chat=%s message=%s active=False pinned=%s edit_ok=%s",
+                chat_id, message_id, pinned_value, edit_ok)
 
     # Удалим активный опрос из памяти — после деактивации он не должен более использоваться
-    del active_poll[chat_id]
-    logger.info("Deactivated poll in %s (%s)", chat_id, reason)
-    return True
+    try:
+        del active_poll[chat_id]
+    except KeyError:
+        pass
 
+    logger.info("Deactivated poll in %s (%s). unpin_success=%s pinned_value=%s", chat_id, reason, unpin_success, pinned_value)
+    return True
 
 # --- Handlers --- #
 
