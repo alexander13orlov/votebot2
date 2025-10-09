@@ -16,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from .config import BOT_TOKEN  # оставлено как есть (config.py в пакете bot)
 
-logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent
@@ -265,7 +265,8 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     # Построим итоговый текст с пометкой "ЗАКРЫТ"
     question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
     participants = info.get("participants", [])
-    lines = [f"{question} (ЗАКРЫТ)", ""]
+    total = len(participants)
+    lines = [f"[{total}], {question} (ЗАКРЫТ)", ""]
     if participants:
         for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
@@ -324,7 +325,7 @@ async def deactivate_cmd(message: Message):
     chat_id = message.chat.id
     res = await deactivate_poll(chat_id, reason=f"manual by {message.from_user.id}")
     if res:
-        await message.reply("Активный опрос деактивирован.")
+        await message.reply("Опрос деактивирован.")
     else:
         await message.reply("Активных опросов нет.")
 
@@ -336,29 +337,48 @@ async def plus_minus_handler(message: Message):
     info = active_poll.get(chat_id)
     if not info:
         return
+
     # проверяем expiry
     if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
         await deactivate_poll(chat_id, reason="expired")
         return
+
     uid = message.from_user.id
     username = message.from_user.username
     fullname = message.from_user.full_name
     participants = info["participants"]
 
+    cmd_settings = find_command_settings(chat_id, info["command"])
+    delete_pm = False
+
+    # Проверяем deleteplusminus в зависимости от типа опроса
+    if info in active_poll.values():
+        if "autopollsettings" in cmd_settings and info.get("expires_at"):
+            delete_pm = cmd_settings.get("autopollsettings", {}).get("deleteplusminus", "false").lower() == "true"
+        elif "manualpollsettings" in cmd_settings:
+            delete_pm = cmd_settings.get("manualpollsettings", {}).get("deleteplusminus", "false").lower() == "true"
+
+    changed = False
     if text == "+":
         if not any(p[0] == uid for p in participants):
             participants.append((uid, username, fullname))
-            # обновляем сообщение
-            cmd_settings = find_command_settings(chat_id, info["command"])
-            await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
-            # Обновим историю с новым списком участников
-            update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
-    else:  # "-"
+            changed = True
+    elif text == "-":
         if any(p[0] == uid for p in participants):
             participants[:] = [p for p in participants if p[0] != uid]
-            cmd_settings = find_command_settings(chat_id, info["command"])
-            await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
-            update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
+            changed = True
+
+    if changed:
+        await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
+        update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
+
+        if delete_pm:
+            await asyncio.sleep(15) #удаляем из чата пользовательские + и - 
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
 
 
 async def autopoll_scheduler():
@@ -438,6 +458,58 @@ async def autopoll_scheduler():
 
         await asyncio.sleep(30)
 
+def build_help_text():
+    lines = [
+        "🤖 *Бот для управления опросами*\n",
+        "*Основные команды:*"
+    ]
+
+    for chat_id_str, chat_conf in SETTINGS.get("chats", {}).items():
+        lines.append(f"\n*Чат:* `{chat_id_str}`")
+        topics = chat_conf.get("topics", {})
+        topic = topics.get("root", {})
+        commands = topic.get("commands", {})
+
+        for cmd_name, cmd_conf in commands.items():
+            question = cmd_conf.get("question", cmd_name)
+            lines.append(f"/{cmd_name} - Создать опрос: \"{question}\"")
+
+            # Автопрос
+            if cmd_conf.get("autopoll", "false").lower() == "true":
+                lines.append(f"   - Автопрос включён")
+                aps = cmd_conf.get("autopollsettings", {})
+                schedule_list = aps.get("schedule_autopoll", [])
+                for sched in schedule_list:
+                    day = sched.get("day", "").capitalize()
+                    create_time = sched.get("createmsg")
+                    deactivate_time = sched.get("deactivatemsg")
+                    lines.append(f"     • {day}: создаётся в {create_time}, закрывается в {deactivate_time}")
+
+            # Настройки ручного опроса
+            mps = cmd_conf.get("manualpollsettings", {})
+            ttl = mps.get("timetolife", 480)
+            pin = mps.get("pin", "false").lower() == "true"
+            unpin = mps.get("unpin", "false").lower() == "true"
+            lines.append(f"   - Время жизни ручного опроса: {ttl} мин. Pin: {pin}, Unpin: {unpin}")
+
+    lines.append("\n*Участие в опросе:*")
+    lines.append("- Чтобы записаться, отправьте `+`")
+    lines.append("- Чтобы снять участие, отправьте `-`")
+    lines.append("\n*Деактивация опроса:*")
+    lines.append("- /deactivate - закрыть активный опрос в этом чате")
+    lines.append("\n*История:*")
+    lines.append("- Бот хранит последние 100 опросов и восстанавливает активный при перезапуске")
+    return "\n".join(lines)
+
+@dp.message(Command(commands=["help"]))
+async def help_cmd(message: types.Message):
+    text = build_help_text()
+    sent = await message.answer(text, parse_mode="Markdown")
+    await asyncio.sleep(100)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
 
 
 async def main():
