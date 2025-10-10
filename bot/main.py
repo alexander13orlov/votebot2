@@ -16,7 +16,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from .config import BOT_TOKEN  # оставлено как есть (config.py в пакете bot)
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent
@@ -65,27 +65,46 @@ def load_history():
         try:
             with open(HISTORY_PATH, "r", encoding="utf-8") as f:
                 history = json.load(f)
-            # Найдём активные записи и восстановим только последнюю активную (восстанавливаем только один активный)
+
+            # Найдём активные записи и восстановим последнюю активную
             active_entries = [h for h in history if h.get("active")]
             if active_entries:
-                # возьмём наиболее позднюю по created_at
                 active_entries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
                 entry = active_entries[0]
                 chat_id = int(entry["chat_id"])
-                # Восстановим в active_poll
-                active_poll.clear()  # гарантируем, что только одна активная запись
+
+                # Восстанавливаем expires_at с корректной TZ
+                expires_at = None
+                if entry.get("expires_at"):
+                    try:
+                        dt = datetime.fromisoformat(entry["expires_at"])
+                        if dt.tzinfo is None:
+                            # если часовой пояс не указан — считаем, что это локальное время (например, Москва)
+                            dt = dt.replace(tzinfo=LOCAL_TZ)
+                        else:
+                            # приводим к локальному
+                            dt = dt.astimezone(LOCAL_TZ)
+                        expires_at = dt
+                    except Exception as e:
+                        logger.warning("Invalid expires_at format in history: %s", e)
+
+                active_poll.clear()
                 active_poll[chat_id] = {
                     "command": entry["command"],
                     "message_id": int(entry["message_id"]),
-                    "expires_at": datetime.fromisoformat(entry["expires_at"]) if entry.get("expires_at") else None,
+                    "expires_at": expires_at,
                     "pinned": bool(entry.get("pinned", False)),
                     "unpin": bool(entry.get("unpin", False)),
                     "participants": _deserialize_participants(entry.get("participants", [])),
                 }
-                logger.info("Restored active poll from history: chat=%s message=%s command=%s",
-                            chat_id, entry["message_id"], entry["command"])
+
+                logger.info(
+                    "Restored active poll from history: chat=%s message=%s command=%s expires_at=%s",
+                    chat_id, entry["message_id"], entry["command"], expires_at
+                )
             else:
                 active_poll.clear()
+
         except Exception as e:
             logger.exception("Failed to load history: %s", e)
             history = []
@@ -93,6 +112,7 @@ def load_history():
     else:
         history = []
         active_poll.clear()
+
 
 
 def save_history():
@@ -189,15 +209,24 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         unpin = aps.get("unpin", "false").lower() == "true"
         deactivatemsg = schedule_entry.get("deactivatemsg")
         deact_time = parse_time_str(deactivatemsg)
-        today = date.today()
-        expires_at = datetime.combine(today, deact_time)
+        print("==========deact_time", deact_time)
+        # local_dt — дата+время в LOCAL_TZ (UTC+3)
+        local_dt = datetime.combine(date.today(), deact_time).replace(tzinfo=LOCAL_TZ)
+        # expires_at — в UTC (храним/сравниваем в UTC)
+        # expires_at = local_dt.astimezone(timezone.utc)
+        expires_at = local_dt.astimezone(timezone.utc).replace(microsecond=0) 
+        logger.debug("Auto poll: local_dt=%s expires_at(utc)=%s", local_dt.isoformat(), expires_at.isoformat())
+        # print("============auto expires_at", expires_at)
     else:
         mps = cmd_settings.get("manualpollsettings", {})
         pin = mps.get("pin", "false").lower() == "true"
         unpin = mps.get("unpin", "false").lower() == "true"
         # timetolife хранится в минутaх в config — если это часы прежде, нужно менять в config
         ttl_minutes = int(mps.get("timetolife", 480))
-        expires_at = datetime.utcnow() + timedelta(minutes=ttl_minutes)
+        # print("==============ttl_minutes", ttl_minutes)
+        # expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).replace(microsecond=0)
+        # print("=============manual expires_at", expires_at)
 
     # Создаём СОВСЕМ НОВОЕ сообщение (никогда не переиспользуем старое)
     text = f"{question}\n\nПока нет участников."
@@ -220,7 +249,7 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         "pinned": pinned,
         "participants": [],
         "unpin": unpin,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }
 
     # Добавим запись в историю (active=True)
@@ -339,7 +368,7 @@ async def plus_minus_handler(message: Message):
         return
 
     # проверяем expiry
-    if info.get("expires_at") and datetime.utcnow() >= info["expires_at"]:
+    if info.get("expires_at") and datetime.now(timezone.utc) >= info["expires_at"]:
         await deactivate_poll(chat_id, reason="expired")
         return
 
@@ -385,30 +414,35 @@ async def autopoll_scheduler():
     logger.info("Autopoll scheduler started")
     while True:
         try:
-            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-            now_local = now_utc.astimezone(LOCAL_TZ)
+            # Всегда работаем в локальном времени (UTC+3)
+            now_local = datetime.now(LOCAL_TZ)
             logger.debug(f"[autopoll] Tick at {now_local.isoformat()} (weekday={now_local.strftime('%a').lower()[:3]})")
 
-            # Проверка и деактивация активных опросов
+            # --- Проверка и авто-деактивация активных опросов ---
             for cid, info in list(active_poll.items()):
                 expires_at = info.get("expires_at")
+
                 if expires_at:
-                    # Приводим expires_at к timezone-aware, если нужно
-                    if expires_at.tzinfo is None:
+                    # Если expires_at хранится в UTC — переведём в локальное
+                    if expires_at.tzinfo == timezone.utc:
+                        expires_at = expires_at.astimezone(LOCAL_TZ)
+                    elif expires_at.tzinfo is None:
                         expires_at = expires_at.replace(tzinfo=LOCAL_TZ)
+
                     key_deact = (cid,)
                     already_deact = last_autodeactivate.get(key_deact)
+
                     if now_local >= expires_at and already_deact != date.today():
-                        logger.info(f"[autopoll] Deactivating poll {cid} due to expiration")
+                        logger.info(f"[autopoll] Deactivating poll {cid} due to expiration (now={now_local}, expires_at={expires_at})")
                         await deactivate_poll(cid, reason="expired by scheduler")
                         last_autodeactivate[key_deact] = date.today()
 
-            # Если уже есть активный опрос, пропускаем создание новых
+            # Если уже есть активный опрос — ждём и не создаём новый
             if active_poll:
                 await asyncio.sleep(30)
                 continue
 
-            # Проходим по чатам и командам
+            # --- Автоматическое создание новых опросов ---
             for chat_id_str, chat_conf in SETTINGS["chats"].items():
                 chat_id = int(chat_id_str)
                 topics = chat_conf.get("topics", {})
@@ -430,16 +464,17 @@ async def autopoll_scheduler():
                         if day != today_weekday:
                             continue
 
+                        # время создания — в локальном часовом поясе
                         sched_dt = datetime.combine(date.today(), create_time).replace(tzinfo=LOCAL_TZ)
                         key = (chat_id, cmd_name, day, sched.get("createmsg"))
                         already = last_autocreate.get(key)
 
                         logger.debug(
-                            f"[autopoll] Check schedule: cmd={cmd_name}, day={day}, target={sched.get('createmsg')}, "
-                            f"today={today_weekday}, sched_dt={sched_dt.isoformat()}, now_local={now_local.isoformat()}"
+                            f"[autopoll] Check schedule: cmd={cmd_name}, day={day}, target={sched_dt.isoformat()}, "
+                            f"now_local={now_local.isoformat()}"
                         )
 
-                        # Проверяем окно запуска (60 секунд)
+                        # Проверяем окно запуска (±60 сек)
                         if sched_dt <= now_local < (sched_dt + timedelta(seconds=60)):
                             if already == date.today():
                                 logger.debug(f"[autopoll] Already executed today for {cmd_name}")
@@ -457,6 +492,7 @@ async def autopoll_scheduler():
             logger.exception("Error in autopoll scheduler: %s", e)
 
         await asyncio.sleep(30)
+
 
 def build_help_text():
     lines = [

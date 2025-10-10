@@ -8,5 +8,4 @@ venv/
 *.log
 *.sqlite3
 settings.json
-polls_state.json
 polls_history.json
