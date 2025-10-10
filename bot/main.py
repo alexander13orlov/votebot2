@@ -158,24 +158,74 @@ def update_history_entry(chat_id: int, message_id: int, **updates):
         logger.warning("History entry not found for update: chat=%s message=%s updates=%s", chat_id, message_id, updates)
 
 
-
-async def edit_poll_message(chat_id: int, message_id: int, question: str, participants: List[tuple]):
+def build_poll_text_with_timer(question: str, participants: List[tuple], expires_at: datetime) -> str:
+    """
+    Формирует текст опроса с количеством участников и оставшимся временем до закрытия.
+    """
     total = len(participants)
-    lines = [f"[{total}]", question, ""]
+    now_utc = datetime.now(timezone.utc)
+    remaining = expires_at - now_utc
+
+    if remaining.total_seconds() <= 0:
+        remaining_str = "0ч0мин"
+    else:
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+        remaining_str = f"{hours}ч{minutes}мин"
+
+    lines = [f"[{total}]", f"{question} Осталось {remaining_str}.", ""]
+
     if participants:
-        for p in participants:
+        for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
             if username:
-                lines.append(f"@{username}")
+                lines.append(f"{idx}. @{username}")
             else:
-                lines.append(f"{fullname}")
+                lines.append(f"{idx}. {fullname}")
     else:
         lines.append("Пока нет участников.")
-    text = "\n".join(lines)
+
+    return "\n".join(lines)
+
+async def active_poll_updater():
+    """
+    Фоновый цикл, который каждые 10 секунд обновляет все активные опросы с таймером.
+    """
+    while True:
+        try:
+            for chat_id, info in list(active_poll.items()):
+                message_id = info["message_id"]
+                expires_at = info["expires_at"]
+                participants = info.get("participants", [])
+
+                # Берём вопрос из настроек команды
+                cmd_settings = find_command_settings(chat_id, info["command"])
+                question = cmd_settings.get("question", info["command"]) if cmd_settings else info["command"]
+
+                text = build_poll_text_with_timer(question, participants, expires_at)
+
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                except TelegramBadRequest as e:
+                    logger.warning(
+                        "Failed to update poll message with timer chat=%s message=%s: %s",
+                        chat_id, message_id, e
+                    )
+        except Exception as e:
+            logger.exception("Error in active_poll_updater: %s", e)
+
+        await asyncio.sleep(10)  # обновление каждые 10 секунд
+
+
+
+
+async def edit_poll_message(chat_id: int, message_id: int, question: str, participants: List[tuple], expires_at: datetime):
+    text = build_poll_text_with_timer(question, participants, expires_at)
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
     except TelegramBadRequest as e:
         logger.warning("Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e)
+
 
 
 def find_command_settings(chat_id: int, command_name: str) -> Optional[dict]:
@@ -261,13 +311,18 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
 
 
     # Создаём СОВСЕМ НОВОЕ сообщение (никогда не переиспользуем старое)
-    text = f"{question}\n\nПока нет участников."
+    text = build_poll_text_with_timer(
+        question,
+        participants=[],
+        expires_at=expires_at
+    )
     sent = await bot.send_message(chat_id, text)
     message_id = sent.message_id
 
     if pin:
         try:
-            await bot.pin_chat_message(chat_id, message_id)
+            # await bot.pin_chat_message(chat_id, message_id)
+            await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
             pinned = True
         except Exception as e:
             logger.warning("Pin failed: %s", e)
@@ -430,7 +485,7 @@ async def plus_minus_handler(message: Message):
             changed = True
 
     if changed:
-        await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants)
+        await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants, info["expires_at"])
         update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
         if delete_pm:
@@ -580,11 +635,14 @@ async def help_cmd(message: types.Message):
 
 
 async def main():
-    # Загрузим историю и восстановим (если есть) активный опрос
     load_history()
-    # Запустим автопланировщик
+
+    # Запуск фонового таска для живого таймера
+    asyncio.create_task(active_poll_updater())
+
+    # Запуск автопланировщика для автопросов
     asyncio.create_task(autopoll_scheduler())
-    # Запуск Polling
+
     await dp.start_polling(bot)
 
 
