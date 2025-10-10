@@ -214,17 +214,24 @@ async def active_poll_updater():
         except Exception as e:
             logger.exception("Error in active_poll_updater: %s", e)
 
-        await asyncio.sleep(10)  # обновление каждые 10 секунд
+        await asyncio.sleep(30)  # обновление каждые 10 секунд
 
-
-
-
-async def edit_poll_message(chat_id: int, message_id: int, question: str, participants: List[tuple], expires_at: datetime):
+async def edit_poll_message(chat_id, message_id, question, participants, expires_at):
     text = build_poll_text_with_timer(question, participants, expires_at)
+    last_text = active_poll[chat_id].get("last_text")
+    if text == last_text:
+        return  # текст не изменился, не обновляем
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        active_poll[chat_id]["last_text"] = text
     except TelegramBadRequest as e:
-        logger.warning("Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e)
+        if "message is not modified" in str(e):
+            pass
+        else:
+            logger.warning(
+                "Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e
+            )
+
 
 
 
