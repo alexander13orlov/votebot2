@@ -431,18 +431,6 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
 # --- Handlers --- #
 
-@dp.message(Command(commands=["saber"]))
-async def saber_cmd(message: Message):
-    chat_id = message.chat.id
-    await create_poll(chat_id, "saber")
-
-
-@dp.message(Command(commands=["rapier"]))
-async def rapier_cmd(message: Message):
-    chat_id = message.chat.id
-    await create_poll(chat_id, "rapier")
-
-
 @dp.message(Command(commands=["deactivate"]))
 async def deactivate_cmd(message: Message):
     chat_id = message.chat.id
@@ -501,8 +489,6 @@ async def plus_minus_handler(message: Message):
                 await message.delete()
             except Exception:
                 pass
-
-
 
 async def autopoll_scheduler():
     logger.info("Autopoll scheduler started")
@@ -587,7 +573,6 @@ async def autopoll_scheduler():
 
         await asyncio.sleep(30)
 
-
 def build_help_text():
     lines = [
         "🤖 *Бот для управления опросами*\n",
@@ -639,6 +624,42 @@ async def help_cmd(message: types.Message):
         await sent.delete()
     except Exception:
         pass
+
+# --- Универсальный хэндлер для ручных опросов --- #
+# Список команд, для которых есть отдельные хэндлеры
+EXCLUDE_COMMANDS = {"help", "deactivate"}
+
+@dp.message(F.text.startswith("/"))
+async def universal_command_handler(message: types.Message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    
+    # Игнорируем + и -
+    if text in {"+", "-"}:
+        return
+
+    # Берём имя команды без /
+    cmd_name = text[1:].split()[0]  # /rapier@bot → rapier@bot
+    
+    # Убираем @username, если есть
+    if "@" in cmd_name:
+        cmd_name = cmd_name.split("@")[0].lower()
+    else:
+        cmd_name = cmd_name.lower()
+    
+    # Пропускаем команды с отдельными хэндлерами
+    if cmd_name in EXCLUDE_COMMANDS:
+        return
+    
+    # Получаем настройки команды
+    cmd_settings = find_command_settings(chat_id, cmd_name)
+    if not cmd_settings:
+        logger.info("No settings for command %s@%s in chat %s", cmd_name, bot.username, chat_id)
+        return
+
+    # Создаём опрос вручную
+    await create_poll(chat_id, cmd_name)
+
 
 
 async def main():
