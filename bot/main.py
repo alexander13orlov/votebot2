@@ -209,7 +209,7 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         unpin = aps.get("unpin", "false").lower() == "true"
         deactivatemsg = schedule_entry.get("deactivatemsg")
         deact_time = parse_time_str(deactivatemsg)
-        print("==========deact_time", deact_time)
+        # print("==========deact_time", deact_time)
         # local_dt — дата+время в LOCAL_TZ (UTC+3)
         local_dt = datetime.combine(date.today(), deact_time).replace(tzinfo=LOCAL_TZ)
         # expires_at — в UTC (храним/сравниваем в UTC)
