@@ -167,13 +167,13 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
     remaining = expires_at - now_utc
 
     if remaining.total_seconds() <= 0:
-        remaining_str = "0ч0мин"
+        remaining_str = "0ч0м"
     else:
         hours, remainder = divmod(int(remaining.total_seconds()), 3600)
         minutes, _ = divmod(remainder, 60)
-        remaining_str = f"{hours}ч{minutes}мин"
+        remaining_str = f"{hours}ч{minutes}м"
 
-    lines = [f"[{total}]", f"{question} Осталось {remaining_str}.", ""]
+    lines = [f"[{total}] {question}", f"Осталось {remaining_str}.", ""]
 
     if participants:
         for idx, p in enumerate(participants, start=1):
@@ -189,7 +189,7 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
 
 async def active_poll_updater():
     """
-    Фоновый цикл, который каждые 10 секунд обновляет все активные опросы с таймером.
+    Фоновый цикл, который каждые 30 секунд обновляет все активные опросы с таймером.
     """
     while True:
         try:
@@ -214,7 +214,7 @@ async def active_poll_updater():
         except Exception as e:
             logger.exception("Error in active_poll_updater: %s", e)
 
-        await asyncio.sleep(30)  # обновление каждые 10 секунд
+        await asyncio.sleep(30)  # обновление каждые 30 секунд
 
 async def edit_poll_message(chat_id, message_id, question, participants, expires_at):
     text = build_poll_text_with_timer(question, participants, expires_at)
@@ -389,7 +389,7 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
     participants = info.get("participants", [])
     total = len(participants)
-    lines = [f"[{total}], {question} (ЗАКРЫТ)", ""]
+    lines = [f"[{total}] {question} (ЗАКРЫТ)", ""]
     if participants:
         for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
@@ -436,7 +436,7 @@ async def deactivate_cmd(message: Message):
     chat_id = message.chat.id
     res = await deactivate_poll(chat_id, reason=f"manual by {message.from_user.id}")
     if res:
-        await message.reply("Опрос деактивирован.")
+        await message.reply("Опрос закрыт.")
     else:
         await message.reply("Активных опросов нет.")
 
@@ -609,7 +609,7 @@ def build_help_text():
     lines.append("\n*Участие в опросе:*")
     lines.append("- Чтобы записаться, отправьте `+`")
     lines.append("- Чтобы снять участие, отправьте `-`")
-    lines.append("\n*Деактивация опроса:*")
+    lines.append("\n*Закрытие опроса:*")
     lines.append("- /deactivate - закрыть активный опрос в этом чате")
     lines.append("\n*История:*")
     lines.append("- Бот хранит последние 100 опросов и восстанавливает активный при перезапуске")
