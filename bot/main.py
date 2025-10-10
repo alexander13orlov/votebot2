@@ -402,7 +402,7 @@ async def plus_minus_handler(message: Message):
         update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
         if delete_pm:
-            await asyncio.sleep(15) #удаляем из чата пользовательские + и - 
+            await asyncio.sleep(4) #удаляем из чата пользовательские + и - 
             try:
                 await message.delete()
             except Exception:
