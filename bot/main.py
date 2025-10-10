@@ -209,24 +209,56 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         unpin = aps.get("unpin", "false").lower() == "true"
         deactivatemsg = schedule_entry.get("deactivatemsg")
         deact_time = parse_time_str(deactivatemsg)
-        # print("==========deact_time", deact_time)
         # local_dt — дата+время в LOCAL_TZ (UTC+3)
         local_dt = datetime.combine(date.today(), deact_time).replace(tzinfo=LOCAL_TZ)
         # expires_at — в UTC (храним/сравниваем в UTC)
-        # expires_at = local_dt.astimezone(timezone.utc)
         expires_at = local_dt.astimezone(timezone.utc).replace(microsecond=0) 
         logger.debug("Auto poll: local_dt=%s expires_at(utc)=%s", local_dt.isoformat(), expires_at.isoformat())
-        # print("============auto expires_at", expires_at)
     else:
         mps = cmd_settings.get("manualpollsettings", {})
         pin = mps.get("pin", "false").lower() == "true"
         unpin = mps.get("unpin", "false").lower() == "true"
-        # timetolife хранится в минутaх в config — если это часы прежде, нужно менять в config
-        ttl_minutes = int(mps.get("timetolife", 480))
-        # print("==============ttl_minutes", ttl_minutes)
-        # expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
-        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).replace(microsecond=0)
-        # print("=============manual expires_at", expires_at)
+
+        # Новый способ: берём schedule_autopoll
+        aps = cmd_settings.get("autopollsettings", {})
+        schedule_list = aps.get("schedule_autopoll", [])
+
+        now_local = datetime.now(timezone.utc).astimezone(LOCAL_TZ)
+        soonest_dt = None
+
+        for sched in schedule_list:
+            day_str = sched.get("day", "").strip().lower()[:3]  # "mon", "tue", ...
+            deactivatemsg = sched.get("deactivatemsg")
+            if not deactivatemsg:
+                continue
+            deact_time = parse_time_str(deactivatemsg)
+
+            # Переводим день в число (0=Mon ... 6=Sun)
+            weekday_map = {"mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6}
+            target_wd = weekday_map.get(day_str)
+            if target_wd is None:
+                continue
+
+            # Вычисляем дату ближайшего target_wd после now_local
+            days_ahead = (target_wd - now_local.weekday() + 7) % 7
+            candidate_date = now_local.date() + timedelta(days=days_ahead)
+            candidate_dt = datetime.combine(candidate_date, deact_time).replace(tzinfo=LOCAL_TZ)
+
+            # Если время уже прошло сегодня, идём на следующую неделю
+            if candidate_dt <= now_local:
+                candidate_dt += timedelta(days=7)
+
+            if soonest_dt is None or candidate_dt < soonest_dt:
+                soonest_dt = candidate_dt
+
+        if soonest_dt is None:
+            # fallback: 8 часов по UTC, на случай, если расписание пустое
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=8)).replace(microsecond=0)
+        else:
+            expires_at = soonest_dt.astimezone(timezone.utc).replace(microsecond=0)
+
+        logger.debug("Manual poll: expires_at(utc)=%s", expires_at.isoformat())
+
 
     # Создаём СОВСЕМ НОВОЕ сообщение (никогда не переиспользуем старое)
     text = f"{question}\n\nПока нет участников."
@@ -523,10 +555,9 @@ def build_help_text():
 
             # Настройки ручного опроса
             mps = cmd_conf.get("manualpollsettings", {})
-            ttl = mps.get("timetolife", 480)
             pin = mps.get("pin", "false").lower() == "true"
             unpin = mps.get("unpin", "false").lower() == "true"
-            lines.append(f"   - Время жизни ручного опроса: {ttl} мин. Pin: {pin}, Unpin: {unpin}")
+            lines.append(f"   - Pin: {pin}, Unpin: {unpin}")
 
     lines.append("\n*Участие в опросе:*")
     lines.append("- Чтобы записаться, отправьте `+`")
