@@ -198,23 +198,28 @@ async def active_poll_updater():
                 expires_at = info["expires_at"]
                 participants = info.get("participants", [])
 
-                # Берём вопрос из настроек команды
                 cmd_settings = find_command_settings(chat_id, info["command"])
                 question = cmd_settings.get("question", info["command"]) if cmd_settings else info["command"]
 
                 text = build_poll_text_with_timer(question, participants, expires_at)
 
-                try:
-                    await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-                except TelegramBadRequest as e:
-                    logger.warning(
-                        "Failed to update poll message with timer chat=%s message=%s: %s",
-                        chat_id, message_id, e
-                    )
+                last_text = info.get("last_text")
+                if text != last_text:
+                    try:
+                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                        info["last_text"] = text
+                    except TelegramBadRequest as e:
+                        if "message is not modified" in str(e):
+                            pass  # текст совпадает, игнорируем
+                        else:
+                            logger.warning(
+                                "Failed to update poll message with timer chat=%s message=%s: %s",
+                                chat_id, message_id, e
+                            )
         except Exception as e:
             logger.exception("Error in active_poll_updater: %s", e)
 
-        await asyncio.sleep(30)  # обновление каждые 30 секунд
+        await asyncio.sleep(30)
 
 async def edit_poll_message(chat_id, message_id, question, participants, expires_at):
     text = build_poll_text_with_timer(question, participants, expires_at)
@@ -373,9 +378,8 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     message_id = info["message_id"]
     pinned = info.get("pinned", False)
     unpin = info.get("unpin", False)
-
     unpin_success = False
-    # Попытка открепить, если это нужно
+
     if pinned and unpin:
         try:
             await bot.unpin_chat_message(chat_id=str(chat_id), message_id=message_id)
@@ -385,7 +389,6 @@ async def deactivate_poll(chat_id: int, reason="manual"):
         except Exception as e:
             logger.warning("Unpin failed: %s", e)
 
-    # Построим итоговый текст с пометкой "ЗАКРЫТ"
     question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
     participants = info.get("participants", [])
     total = len(participants)
@@ -400,18 +403,25 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     else:
         lines.append("Никто не записался.")
 
-    # Пытаемся обновить текст сообщения (именованные аргументы + chat_id как строка)
-    try:
-        await bot.edit_message_text(text="\n".join(lines), chat_id=str(chat_id), message_id=message_id)
-        edit_ok = True
-    except Exception as e:
-        edit_ok = False
-        logger.warning("Failed to edit message when closing poll chat=%s message=%s: %s", chat_id, message_id, e)
+    new_text = "\n".join(lines)
+    last_text = info.get("last_text")
+    if new_text != last_text:
+        try:
+            await bot.edit_message_text(chat_id=str(chat_id), message_id=message_id, text=new_text)
+            info["last_text"] = new_text
+            edit_ok = True
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                edit_ok = True  # текст совпадает, считаем, что редактирование прошло успешно
+            else:
+                edit_ok = False
+                logger.warning(
+                    "Failed to edit message when closing poll chat=%s message=%s: %s", chat_id, message_id, e
+                )
+    else:
+        edit_ok = True  # текст не изменился, обновлять не нужно — считаем успехом
 
-    # Решаем финальное значение pinned в истории: если we successfully unpinned -> False, иначе сохраняем текущее info['pinned']
     pinned_value = False if unpin_success else bool(info.get("pinned", False))
-
-    # Обновим историю: пометим запись как inactive и установим pinned_value и финальный список участников
     update_history_entry(chat_id, message_id,
                          active=False,
                          pinned=pinned_value,
@@ -420,7 +430,6 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     logger.info("History updated for chat=%s message=%s active=False pinned=%s edit_ok=%s",
                 chat_id, message_id, pinned_value, edit_ok)
 
-    # Удалим активный опрос из памяти — после деактивации он не должен более использоваться
     try:
         del active_poll[chat_id]
     except KeyError:
@@ -428,6 +437,7 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
     logger.info("Deactivated poll in %s (%s). unpin_success=%s pinned_value=%s", chat_id, reason, unpin_success, pinned_value)
     return True
+
 
 # --- Handlers --- #
 
@@ -445,25 +455,26 @@ async def deactivate_cmd(message: Message):
 async def plus_minus_handler(message: Message):
     chat_id = message.chat.id
     text = message.text.strip()
+
     info = active_poll.get(chat_id)
     if not info:
+        # Нет активного опроса — игнорируем
         return
 
-    # проверяем expiry
-    if info.get("expires_at") and datetime.now(timezone.utc) >= info["expires_at"]:
-        await deactivate_poll(chat_id, reason="expired")
+    # Если опрос истёк — игнорируем (деактивация делается scheduler-ом)
+    expires_at = info.get("expires_at")
+    if expires_at and datetime.now(timezone.utc) >= expires_at:
         return
 
     uid = message.from_user.id
     username = message.from_user.username
     fullname = message.from_user.full_name
-    participants = info["participants"]
+    participants = info.get("participants", [])
 
     cmd_settings = find_command_settings(chat_id, info["command"])
     delete_pm = False
-
-    # Проверяем deleteplusminus в зависимости от типа опроса
-    if info in active_poll.values():
+    if cmd_settings:
+        # берём настройку удаления только если есть настройки
         if "autopollsettings" in cmd_settings and info.get("expires_at"):
             delete_pm = cmd_settings.get("autopollsettings", {}).get("deleteplusminus", "false").lower() == "true"
         elif "manualpollsettings" in cmd_settings:
@@ -480,11 +491,12 @@ async def plus_minus_handler(message: Message):
             changed = True
 
     if changed:
-        await edit_poll_message(chat_id, info["message_id"], cmd_settings["question"], participants, info["expires_at"])
+        question = cmd_settings.get("question", info["command"]) if cmd_settings else info["command"]
+        await edit_poll_message(chat_id, info["message_id"], question, participants, info.get("expires_at"))
         update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
         if delete_pm:
-            await asyncio.sleep(4) #удаляем из чата пользовательские + и - 
+            await asyncio.sleep(4)
             try:
                 await message.delete()
             except Exception:
