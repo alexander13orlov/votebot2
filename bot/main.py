@@ -179,7 +179,7 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
         for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
             if username:
-                lines.append(f"{idx}. @{username}")
+                lines.append(f"{idx}. @{username} {fullname}")
             else:
                 lines.append(f"{idx}. {fullname}")
     else:
