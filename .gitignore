@@ -9,3 +9,4 @@ venv/
 *.sqlite3
 settings.json
 polls_history.json
+ideas.txt

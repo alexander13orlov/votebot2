@@ -466,19 +466,28 @@ async def stat_cmd(message: Message):
         await message.reply("У вас нет прав для использования этой команды.")
         return
 
-    # Собираем уникальные username и соответствующие fullname из истории
+    # Собираем уникальные uid и соответствующие данные из истории
     user_data = {}
     for entry in history:
         for participant in entry.get("participants", []):
+            uid = participant.get("uid")
             username = participant.get("username")
             fullname = participant.get("fullname", "")
-            if username:  # игнорируем None и пустые username
-                # Если username уже есть, сохраняем самый длинный fullname
-                if username not in user_data or len(fullname) > len(user_data[username]):
-                    user_data[username] = fullname
+            
+            if uid:  # используем uid вместо username
+                # Если uid уже есть, сохраняем самые актуальные данные (из последней записи)
+                if uid not in user_data:
+                    user_data[uid] = {
+                        "username": username,
+                        "fullname": fullname
+                    }
+                # Если в текущей записи есть username, а в сохраненных данных нет - обновляем
+                elif username and not user_data[uid]["username"]:
+                    user_data[uid]["username"] = username
+                    user_data[uid]["fullname"] = fullname
 
     if not user_data:
-        await message.reply("В истории опросов нет участников с username.")
+        await message.reply("В истории опросов нет участников.")
         return
 
     # Создаем инлайн-клавиатуру с кнопками
@@ -487,50 +496,57 @@ async def stat_cmd(message: Message):
     # Кнопка "ВСЕ" в начале
     keyboard.append([InlineKeyboardButton(text="👥 ВСЕ", callback_data="stat_ALL")])
     
-    # Кнопки с username и fullname
-    for username, fullname in sorted(user_data.items()):
-        # Формируем текст кнопки: username + сокращенный fullname
-        button_text = f"@{username}"
-        if fullname:
-            # Добавляем fullname, обрезая если слишком длинный
-            max_fullname_length = 20  # Максимальная длина fullname на кнопке
-            shortened_fullname = fullname[:max_fullname_length] + "..." if len(fullname) > max_fullname_length else fullname
-            button_text += f" {shortened_fullname}"
+    # Кнопки с данными пользователей
+    for uid, data in sorted(user_data.items()):
+        username = data["username"]
+        fullname = data["fullname"]
         
-        keyboard.append([InlineKeyboardButton(text=button_text, callback_data=f"stat_{username}")])
+        # Формируем текст кнопки: username + fullname, или только fullname если username нет
+        if username:
+            button_text = f"@{username} {fullname}"
+        else:
+            button_text = fullname
+        
+        # Обрезаем если слишком длинный
+        max_button_length = 30
+        if len(button_text) > max_button_length:
+            button_text = button_text[:max_button_length] + "..."
+        
+        # Используем uid в callback_data
+        keyboard.append([InlineKeyboardButton(text=button_text, callback_data=f"stat_{uid}")])
     
     # Кнопка "Отмена" в конце
     keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="stat_cancel")])
 
     reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-    # Сохраняем состояние ожидания выбора username
+    # Сохраняем состояние ожидания выбора
     stat_waiting_username[message.from_user.id] = True
 
     await message.reply("Выберите пользователя для фильтрации статистики:", reply_markup=reply_markup)
 
-# Добавьте обработчик нажатий на кнопки инлайн-клавиатуры
+# Обработчик нажатий на кнопки инлайн-клавиатуры
 @dp.callback_query(F.data.startswith("stat_"))
 async def stat_callback_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     
-    # Проверяем, что пользователь ожидает выбора username
+    # Проверяем, что пользователь ожидает выбора
     if user_id not in stat_waiting_username:
         await callback.answer("Сессия устарела. Вызовите /stat снова.", show_alert=True)
         return
 
-    # Извлекаем выбранный username из callback_data
+    # Извлекаем выбранный uid из callback_data
     callback_data = callback.data
-    selected_username = callback_data[5:]  # Убираем "stat_"
+    selected_uid = callback_data[5:]  # Убираем "stat_"
 
     # Обработка кнопки "Отмена"
-    if selected_username == "cancel":
+    if selected_uid == "cancel":
         del stat_waiting_username[user_id]
         await callback.message.edit_text("Операция отменена.")
         await callback.answer()
         return
 
-    # Удаляем состояние ожидания (кроме случая отмены)
+    # Удаляем состояние ожидания
     del stat_waiting_username[user_id]
 
     # Собираем данные из истории
@@ -550,14 +566,16 @@ async def stat_callback_handler(callback: CallbackQuery):
         command = entry.get("command", "")
         
         for participant in entry.get("participants", []):
+            uid = participant.get("uid")
             fullname = participant.get("fullname", "")
             username = participant.get("username", "")
             
-            # Фильтруем по выбранному username, если не выбрано "ВСЕ"
-            if selected_username != "ALL" and username != selected_username:
+            # Фильтруем по выбранному uid, если не выбрано "ВСЕ"
+            if selected_uid != "ALL" and str(uid) != selected_uid:
                 continue
                 
             data.append({
+                "uid": uid,
                 "fullname": fullname,
                 "username": username,
                 "expires_at": expires_date,
@@ -574,7 +592,7 @@ async def stat_callback_handler(callback: CallbackQuery):
 
     # Создаем CSV файл в памяти
     output = io.StringIO()
-    fieldnames = ["fullname", "username", "expires_at", "command"]
+    fieldnames = ["uid", "fullname", "username", "expires_at", "command"]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     
@@ -585,22 +603,42 @@ async def stat_callback_handler(callback: CallbackQuery):
     csv_data = output.getvalue().encode('utf-8')
     output.close()
 
-    filename = f"poll_statistics_{selected_username}.csv" if selected_username != "ALL" else "poll_statistics_all.csv"
+    # Определяем имя файла в зависимости от выбора
+    if selected_uid == "ALL":
+        filename = "poll_statistics_all.csv"
+        display_name = "всех пользователей"
+    else:
+        # Находим данные выбранного пользователя для красивого имени файла
+        user_info = None
+        for entry in history:
+            for participant in entry.get("participants", []):
+                if str(participant.get("uid")) == selected_uid:
+                    user_info = participant
+                    break
+            if user_info:
+                break
+        
+        if user_info:
+            username = user_info.get("username")
+            fullname = user_info.get("fullname", "")
+            if username:
+                display_name = f"@{username}"
+            else:
+                display_name = fullname
+            filename = f"poll_statistics_{display_name.replace(' ', '_')}.csv"
+        else:
+            display_name = f"uid_{selected_uid}"
+            filename = f"poll_statistics_{selected_uid}.csv"
     
     # Редактируем сообщение с клавиатурой и отправляем файл
-    await callback.message.edit_text(f"Статистика для: {selected_username if selected_username != 'ALL' else 'всех пользователей'}")
+    await callback.message.edit_text(f"Статистика для: {display_name}")
     
     await callback.message.answer_document(
         types.BufferedInputFile(csv_data, filename=filename),
-        caption=f"Статистика опросов - {selected_username if selected_username != 'ALL' else 'Все пользователи'}"
+        caption=f"Статистика опросов - {display_name}"
     )
     
     await callback.answer()
-
-# Убираем обработчик команды /cancel, так как теперь есть кнопка отмены
-
-
-
 
 
 
