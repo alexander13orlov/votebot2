@@ -225,7 +225,7 @@ def update_history_entry(chat_id: int, message_id: int, **updates):
 
 def build_poll_text_with_timer(question: str, participants: List[tuple], expires_at: datetime) -> str:
     """
-    Формирует текст опроса с моноширинным форматированием через HTML
+    Формирует текст опроса с правильным форматированием
     """
     total = len(participants)
     now_utc = datetime.now(timezone.utc)
@@ -241,7 +241,7 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
     # Экранируем для HTML
     question_escaped = html.escape(question)
     
-    # Формируем текст с моноширинным шрифтом через <code> тег
+    # Формируем текст с комбинированным форматированием
     lines = []
     lines.append(f"<b>{question_escaped}</b>")
     lines.append(f"⏰ Осталось: <code>{html.escape(remaining_str)}</code>")
@@ -253,15 +253,12 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
             uid, username, fullname = p
             fullname_escaped = html.escape(fullname)
             
-            if username:
-                username_escaped = html.escape(username)
-                # Обернем всю строку в <code> для моноширинного шрифта
-                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
-            else:
-                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
+            # Всегда показываем username, даже если он None
+            username_display = f"@{html.escape(username)}" if username else "None"
+            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
     else:
-        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
-        lines.append("<code>Пока нет участников</code>")
+        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        lines.append("Пока нет участников")
 
     return "\n".join(lines)
 
@@ -809,16 +806,15 @@ def build_closed_poll_text(question: str, participants: List[tuple]) -> str:
             uid, username, fullname = p
             fullname_escaped = html.escape(fullname)
             
-            if username:
-                username_escaped = html.escape(username)
-                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
-            else:
-                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
+            # Всегда показываем username, даже если он None
+            username_display = f"@{html.escape(username)}" if username else "None"
+            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
     else:
-        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
-        lines.append("<code>Никто не записался</code>")
+        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        lines.append("Никто не записался")
 
     return "\n".join(lines)
+
 
 def build_edit_poll_text(question: str, participants: List[tuple]) -> str:
     """
@@ -839,25 +835,17 @@ def build_edit_poll_text(question: str, participants: List[tuple]) -> str:
             uid, username, fullname = p
             fullname_escaped = html.escape(fullname)
             
-            if username:
-                username_escaped = html.escape(username)
-                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
-            else:
-                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
+            # Всегда показываем username, даже если он None
+            username_display = f"@{html.escape(username)}" if username else "None"
+            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
     else:
-        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
-        lines.append("<code>Пока нет участников</code>")
+        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        lines.append("Пока нет участников")
 
     lines.append("")
     lines.append("Выберите действие:")
     
     return "\n".join(lines)
-
-
-
-
-
-
 
 # ---------------------------------------------------- Handlers ------------------------------------------------------ #
 
