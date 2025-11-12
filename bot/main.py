@@ -662,9 +662,19 @@ def build_edit_keyboard() -> InlineKeyboardMarkup:
 def build_remove_user_keyboard(participants: List[tuple]) -> InlineKeyboardMarkup:
     keyboard = []
     for uid, username, fullname in participants:
-        display_name = f"@{username}" if username else fullname
-        if len(display_name) > 30:
-            display_name = display_name[:30] + "..."
+        # Формируем текст кнопки: username + fullname, или только fullname если username нет
+        if username and fullname:
+            display_name = f"@{username} ({fullname})"
+        elif username:
+            display_name = f"@{username}"
+        else:
+            display_name = fullname
+        
+        # Обрезаем если слишком длинный
+        max_button_length = 30
+        if len(display_name) > max_button_length:
+            display_name = display_name[:max_button_length] + "..."
+            
         keyboard.append([
             InlineKeyboardButton(
                 text=display_name, 
@@ -680,9 +690,19 @@ def build_remove_user_keyboard(participants: List[tuple]) -> InlineKeyboardMarku
 def build_add_user_keyboard(available_users: List[tuple]) -> InlineKeyboardMarkup:
     keyboard = []
     for uid, username, fullname in available_users:
-        display_name = f"@{username}" if username else fullname
-        if len(display_name) > 30:
-            display_name = display_name[:30] + "..."
+        # Формируем текст кнопки: username + fullname, или только fullname если username нет
+        if username and fullname:
+            display_name = f"@{username} ({fullname})"
+        elif username:
+            display_name = f"@{username}"
+        else:
+            display_name = fullname
+        
+        # Обрезаем если слишком длинный
+        max_button_length = 30
+        if len(display_name) > max_button_length:
+            display_name = display_name[:max_button_length] + "..."
+            
         keyboard.append([
             InlineKeyboardButton(
                 text=display_name, 
@@ -693,7 +713,6 @@ def build_add_user_keyboard(available_users: List[tuple]) -> InlineKeyboardMarku
         InlineKeyboardButton(text="↩️ Назад", callback_data="edit_back")
     ])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
 
 # Таймер сессии редактирования (1 минута)
 async def edit_session_timer(admin_id: int):
@@ -1364,13 +1383,16 @@ async def stat_cmd(message: Message):
     keyboard.append([InlineKeyboardButton(text="👥 ВСЕ", callback_data="stat_ALL")])
     
     # Кнопки с данными пользователей
+    
     for uid, data in sorted(user_data.items()):
         username = data["username"]
         fullname = data["fullname"]
         
         # Формируем текст кнопки: username + fullname, или только fullname если username нет
-        if username:
-            button_text = f"@{username} {fullname}"
+        if username and fullname:
+            button_text = f"@{username} ({fullname})"
+        elif username:
+            button_text = f"@{username}"
         else:
             button_text = fullname
         
