@@ -989,6 +989,16 @@ async def edit_callback_handler(callback: CallbackQuery):
         new_participants = [p for p in participants if p[0] != uid]
         poll_entry["participants"] = _serialize_participants(new_participants)
         
+        # ОБНОВЛЯЕМ АКТИВНЫЙ ОПРОС В ПАМЯТИ (если он активен)
+        chat_id = session["chat_id"]
+        message_id = session["message_id"]
+        if chat_id in active_poll and active_poll[chat_id]["message_id"] == message_id:
+            active_poll[chat_id]["participants"] = new_participants
+            # Сбрасываем last_text, чтобы принудительно обновить сообщение
+            if "last_text" in active_poll[chat_id]:
+                del active_poll[chat_id]["last_text"]
+            logger.info(f"✅ Updated active poll in memory for chat {chat_id}")
+        
         # Обновляем сообщение в чате (если возможно)
         success = await update_poll_message(
             session["chat_id"], 
@@ -1003,7 +1013,8 @@ async def edit_callback_handler(callback: CallbackQuery):
             session["message_id"],
             participants=_serialize_participants(new_participants)
         )
-        
+    
+            
         # Возвращаемся к основному меню
         participants_count = len(new_participants)
         question = poll_entry.get("command", "Опрос")
@@ -1059,6 +1070,16 @@ async def edit_callback_handler(callback: CallbackQuery):
         new_participants = participants + [user_to_add]
         poll_entry["participants"] = _serialize_participants(new_participants)
         
+        # ОБНОВЛЯЕМ АКТИВНЫЙ ОПРОС В ПАМЯТИ (если он активен)
+        chat_id = session["chat_id"]
+        message_id = session["message_id"]
+        if chat_id in active_poll and active_poll[chat_id]["message_id"] == message_id:
+            active_poll[chat_id]["participants"] = new_participants
+            # Сбрасываем last_text, чтобы принудительно обновить сообщение
+            if "last_text" in active_poll[chat_id]:
+                del active_poll[chat_id]["last_text"]
+            logger.info(f"✅ Updated active poll in memory for chat {chat_id}")
+        
         # Обновляем сообщение в чате (если возможно)
         success = await update_poll_message(
             session["chat_id"], 
@@ -1073,6 +1094,8 @@ async def edit_callback_handler(callback: CallbackQuery):
             session["message_id"],
             participants=_serialize_participants(new_participants)
         )
+        
+        # ... остальной код ...
         
         # Возвращаемся к основному меню
         participants_count = len(new_participants)
