@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
 from .config import BOT_TOKEN, ADMIN_IDS
@@ -46,6 +46,55 @@ last_autocreate: Dict[tuple, date] = {}
 last_autodeactivate = {}
 # История — список последних опросов (новейшие в начале)
 history: List[Dict[str, Any]] = []
+
+
+def build_poll_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру для опроса"""
+    keyboard = [
+        [
+            InlineKeyboardButton(text="✅ Участвую", callback_data="poll_join"),
+            InlineKeyboardButton(text="🔄 Пас", callback_data="poll_leave")  # Изменено на "Пас"
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def parse_time_str(t: str) -> time:
@@ -214,11 +263,21 @@ async def active_poll_updater():
                 last_text = info.get("last_text")
                 if text != last_text:
                     try:
-                        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+                        await bot.edit_message_text(
+                            chat_id=chat_id, 
+                            message_id=message_id, 
+                            text=text,
+                            reply_markup=build_poll_keyboard()
+                        )
                         info["last_text"] = text
                     except TelegramBadRequest as e:
                         if "message is not modified" in str(e):
-                            pass  # текст совпадает, игнорируем
+                            pass
+                        elif "message to edit not found" in str(e):
+                            logger.warning(f"Message not found in updater: chat_id={chat_id}, message_id={message_id}")
+                            # Если сообщение не найдено, снимаем опрос с активного
+                            if chat_id in active_poll:
+                                del active_poll[chat_id]
                         else:
                             logger.warning(
                                 "Failed to update poll message with timer chat=%s message=%s: %s",
@@ -230,16 +289,29 @@ async def active_poll_updater():
         await asyncio.sleep(30)
 
 async def edit_poll_message(chat_id, message_id, question, participants, expires_at):
+    if chat_id not in active_poll:
+        return
+        
     text = build_poll_text_with_timer(question, participants, expires_at)
     last_text = active_poll[chat_id].get("last_text")
     if text == last_text:
         return  # текст не изменился, не обновляем
+        
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        await bot.edit_message_text(
+            chat_id=chat_id, 
+            message_id=message_id, 
+            text=text,
+            reply_markup=build_poll_keyboard()
+        )
         active_poll[chat_id]["last_text"] = text
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             pass
+        elif "message to edit not found" in str(e):
+            logger.warning(f"Message not found in edit_poll_message: chat_id={chat_id}, message_id={message_id}")
+            if chat_id in active_poll:
+                del active_poll[chat_id]
         else:
             logger.warning(
                 "Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e
@@ -329,19 +401,23 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
 
         logger.debug("Manual poll: expires_at(utc)=%s", expires_at.isoformat())
 
-
     # Создаём СОВСЕМ НОВОЕ сообщение (никогда не переиспользуем старое)
     text = build_poll_text_with_timer(
         question,
         participants=[],
         expires_at=expires_at
     )
-    sent = await bot.send_message(chat_id, text)
+    
+    # Отправляем сообщение с инлайн-клавиатурой
+    sent = await bot.send_message(
+        chat_id, 
+        text, 
+        reply_markup=build_poll_keyboard()
+    )
     message_id = sent.message_id
 
     if pin:
         try:
-            # await bot.pin_chat_message(chat_id, message_id)
             await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
             pinned = True
         except Exception as e:
@@ -415,7 +491,13 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     last_text = info.get("last_text")
     if new_text != last_text:
         try:
-            await bot.edit_message_text(chat_id=str(chat_id), message_id=message_id, text=new_text)
+            # Убираем клавиатуру при деактивации
+            await bot.edit_message_text(
+                chat_id=str(chat_id), 
+                message_id=message_id, 
+                text=new_text,
+                reply_markup=None
+            )
             info["last_text"] = new_text
             edit_ok = True
         except TelegramBadRequest as e:
@@ -451,6 +533,97 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
 # Глобальная переменная для хранения состояния
 stat_waiting_username = {}
+
+
+# Добавим словарь для отслеживания последнего callback от пользователя
+user_last_callback = {}
+
+# Улучшенный обработчик инлайн-кнопок опроса
+@dp.callback_query(F.data.startswith("poll_"))
+async def poll_button_handler(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user = callback.from_user
+    uid = user.id
+    username = user.username
+    fullname = user.full_name
+    
+    # Защита от спама нажатий - игнорируем частые нажатия от одного пользователя
+    current_time = datetime.now(timezone.utc).timestamp()
+    last_callback_time = user_last_callback.get(uid, 0)
+    if current_time - last_callback_time < 1:  # Не чаще 1 раза в секунду
+        await callback.answer("Подождите немного перед следующим действием", show_alert=False)
+        return
+    
+    user_last_callback[uid] = current_time
+    
+    # Проверяем, есть ли активный опрос
+    info = active_poll.get(chat_id)
+    if not info:
+        await callback.answer("Опрос не активен", show_alert=True)
+        return
+        
+    # Проверяем, не истек ли опрос
+    expires_at = info.get("expires_at")
+    if expires_at and datetime.now(timezone.utc) >= expires_at:
+        await callback.answer("Опрос уже завершен", show_alert=True)
+        return
+    
+    participants = info.get("participants", [])
+    user_in_list = any(p[0] == uid for p in participants)
+    changed = False
+    action_performed = False
+    
+    if callback.data == "poll_join":
+        if not user_in_list:
+            participants.append((uid, username, fullname))
+            changed = True
+            action_performed = True
+            await callback.answer("Вы добавлены в список участников")
+        else:
+            await callback.answer("Вы уже в списке участников")
+            
+    elif callback.data == "poll_leave":
+        if user_in_list:
+            participants[:] = [p for p in participants if p[0] != uid]
+            changed = True
+            action_performed = True
+            await callback.answer("Вы удалены из списка участников")
+        else:
+            # ИСПРАВЛЕНО: используем answer вместо alert
+            await callback.answer("Вас нет в списке участников")
+    
+    # Обновляем сообщение только если произошли реальные изменения
+    if changed and action_performed:
+        # Обновляем сообщение опроса
+        cmd_settings = find_command_settings(chat_id, info["command"])
+        question = cmd_settings.get("question", info["command"]) if cmd_settings else info["command"]
+        
+        # Формируем новый текст
+        new_text = build_poll_text_with_timer(question, participants, expires_at)
+        
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=info["message_id"],
+                text=new_text,
+                reply_markup=build_poll_keyboard()
+            )
+            # Сохраняем новый текст
+            if "last_text" not in info or info["last_text"] != new_text:
+                info["last_text"] = new_text
+                
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                # Игнорируем, если сообщение не изменилось
+                pass
+            elif "message to edit not found" in str(e):
+                logger.warning(f"Message not found: chat_id={chat_id}, message_id={info['message_id']}")
+            else:
+                logger.warning(f"Failed to update poll message: {e}")
+        
+        # Обновляем историю
+        update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
+
 
 # Добавьте обработчик команды /stat
 @dp.message(Command(commands=["stat"]))
@@ -661,56 +834,7 @@ async def deactivate_cmd(message: Message):
         await message.reply("Активных опросов нет.")
 
 
-@dp.message(F.text.in_({"+", "-"}))
-async def plus_minus_handler(message: Message):
-    chat_id = message.chat.id
-    text = message.text.strip()
 
-    info = active_poll.get(chat_id)
-    if not info:
-        # Нет активного опроса — игнорируем
-        return
-
-    # Если опрос истёк — игнорируем (деактивация делается scheduler-ом)
-    expires_at = info.get("expires_at")
-    if expires_at and datetime.now(timezone.utc) >= expires_at:
-        return
-
-    uid = message.from_user.id
-    username = message.from_user.username
-    fullname = message.from_user.full_name
-    participants = info.get("participants", [])
-
-    cmd_settings = find_command_settings(chat_id, info["command"])
-    delete_pm = False
-    if cmd_settings:
-        # берём настройку удаления только если есть настройки
-        if "autopollsettings" in cmd_settings and info.get("expires_at"):
-            delete_pm = cmd_settings.get("autopollsettings", {}).get("deleteplusminus", "false").lower() == "true"
-        elif "manualpollsettings" in cmd_settings:
-            delete_pm = cmd_settings.get("manualpollsettings", {}).get("deleteplusminus", "false").lower() == "true"
-
-    changed = False
-    if text == "+":
-        if not any(p[0] == uid for p in participants):
-            participants.append((uid, username, fullname))
-            changed = True
-    elif text == "-":
-        if any(p[0] == uid for p in participants):
-            participants[:] = [p for p in participants if p[0] != uid]
-            changed = True
-
-    if changed:
-        question = cmd_settings.get("question", info["command"]) if cmd_settings else info["command"]
-        await edit_poll_message(chat_id, info["message_id"], question, participants, info.get("expires_at"))
-        update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
-
-        if delete_pm:
-            await asyncio.sleep(4)
-            try:
-                await message.delete()
-            except Exception:
-                pass
 
 async def autopoll_scheduler():
     logger.info("Autopoll scheduler started")
@@ -829,10 +953,15 @@ def build_help_text():
             lines.append(f"   - Pin: {pin}, Unpin: {unpin}")
 
     lines.append("\n*Участие в опросе:*")
-    lines.append("- Чтобы записаться, отправьте `+`")
-    lines.append("- Чтобы снять участие, отправьте `-`")
+    lines.append("- Используйте кнопки \"✅ Участвую\" и \"🔄 Пас\" под сообщением опроса")
+    lines.append("- Нажмите \"✅ Участвую\" чтобы добавиться в список")
+    lines.append("- Нажмите \"🔄 Пас\" чтобы удалиться из списка")
+    lines.append("- Можно нажимать кнопки многократно - бот корректно обработает все действия")
     lines.append("\n*Закрытие опроса:*")
     lines.append("- /deactivate - закрыть активный опрос в этом чате")
+    lines.append("\n*Статистика:*")
+    lines.append("- /stat - получить статистику по опросам (только для админов)")
+    lines.append("- /top5 - топ-5 самых активных участников")
     lines.append("\n*История:*")
     lines.append("- Бот хранит последние 100 опросов и восстанавливает активный при перезапуске")
     return "\n".join(lines)
@@ -849,7 +978,123 @@ async def help_cmd(message: types.Message):
 
 # --- Универсальный хэндлер для ручных опросов --- #
 # Список команд, для которых есть отдельные хэндлеры
-EXCLUDE_COMMANDS = {"help", "deactivate"}
+EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5"}
+@dp.message(Command(commands=["top5"]))
+async def top5_cmd(message: Message):
+    # 'Bot' object has no attribute 'username' - используем get_me() для получения информации о боте
+    chat_id = message.chat.id
+    
+    # Проверяем, что команда вызвана в групповом чате
+    if message.chat.type not in ["group", "supergroup"]:
+        await message.answer("Эта команда доступна только в групповых чатах.")
+        return
+    
+    # Проверяем права админа
+    user_id = str(message.from_user.id)
+    if user_id not in ADMIN_IDS:
+        await message.answer("У вас нет прав для использования этой команды.")
+        return
+    
+    # Вычисляем дату два месяца назад
+    now = datetime.now(timezone.utc)
+    two_months_ago = now - timedelta(days=60)
+    
+    # Собираем статистику тренировок
+    training_days = {}  # {date: set(participant_uids)}
+    user_stats = {}     # {uid: {"count": int, "latest_name": str}}
+    
+    for entry in history:
+        try:
+            # Пропускаем активные опросы
+            if entry.get("active", False):
+                continue
+                
+            # Получаем дату тренировки из expires_at
+            expires_at_str = entry.get("expires_at")
+            if not expires_at_str:
+                continue
+                
+            # Парсим дату
+            expires_dt = datetime.fromisoformat(expires_at_str)
+            
+            # Фильтруем по времени (последние 2 месяца)
+            if expires_dt < two_months_ago:
+                continue
+                
+            # Получаем участников
+            participants = entry.get("participants", [])
+            
+            # Пропускаем тренировки с менее чем 4 участниками
+            if len(participants) < 4:
+                continue
+                
+            # Дата тренировки (без времени)
+            training_date = expires_dt.date()
+            
+            # Добавляем участников в статистику по дате
+            for participant in participants:
+                uid = participant.get("uid")
+                username = participant.get("username")
+                fullname = participant.get("fullname", "")
+                
+                if not uid:
+                    continue
+                    
+                # Обновляем информацию о пользователе
+                if uid not in user_stats:
+                    user_stats[uid] = {"count": 0, "latest_name": ""}
+                
+                # Обновляем имя (используем последнее доступное)
+                display_name = f"@{username}" if username else fullname
+                if display_name:
+                    user_stats[uid]["latest_name"] = display_name
+                
+                # Увеличиваем счетчик тренировок
+                if training_date not in training_days:
+                    training_days[training_date] = set()
+                
+                # Если пользователь еще не учтен за эту дату
+                if uid not in training_days[training_date]:
+                    training_days[training_date].add(uid)
+                    user_stats[uid]["count"] += 1
+                    
+        except Exception as e:
+            logger.warning(f"Error processing history entry for top5: {e}")
+            continue
+    
+    # Формируем топ-5 участников
+    top_users = []
+    for uid, stats in user_stats.items():
+        if stats["count"] > 0 and stats["latest_name"]:
+            top_users.append({
+                "name": stats["latest_name"],
+                "count": stats["count"]
+            })
+    
+    # Сортируем по количеству тренировок (по убыванию)
+    top_users.sort(key=lambda x: x["count"], reverse=True)
+    top_5 = top_users[:5]
+    
+    # Формируем сообщение с результатами
+    if not top_5:
+        await message.answer("За последние 2 месяцев нет данных о тренировках с 4+ участниками.")
+        return
+    
+    lines = ["🏆 ТОП-5 самых активных участников за последние 2 месяца:\n"]
+    
+    for i, user in enumerate(top_5, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🔸"
+        lines.append(f"{medal} {user['name']} - {user['count']} тренировок")
+    
+    lines.append(f"\nУсловия: учитываются только тренировки с 4+ участниками")
+    lines.append(f"Период: последние 2 месяца")
+    lines.append(f"Всего тренировок учтено: {len(training_days)}")
+    
+    result_text = "\n".join(lines)
+    
+    # Просто отправляем сообщение
+    await message.answer(result_text)
+
 
 @dp.message(F.text.startswith("/"))
 async def universal_command_handler(message: types.Message):
@@ -876,7 +1121,9 @@ async def universal_command_handler(message: types.Message):
     # Получаем настройки команды
     cmd_settings = find_command_settings(chat_id, cmd_name)
     if not cmd_settings:
-        logger.info("No settings for command %s@%s in chat %s", cmd_name, bot.username, chat_id)
+        # Исправляем получение username бота
+        bot_info = await bot.get_me()
+        logger.info("No settings for command %s@%s in chat %s", cmd_name, bot_info.username, chat_id)
         return
 
     # Создаём опрос вручную
