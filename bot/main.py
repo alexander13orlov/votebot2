@@ -22,7 +22,7 @@ from datetime import datetime
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
-
+import html
 
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -215,9 +215,11 @@ def update_history_entry(chat_id: int, message_id: int, **updates):
         logger.warning("History entry not found for update: chat=%s message=%s updates=%s", chat_id, message_id, updates)
 
 
+
+
 def build_poll_text_with_timer(question: str, participants: List[tuple], expires_at: datetime) -> str:
     """
-    Формирует текст опроса с количеством участников и оставшимся временем до закрытия.
+    Формирует текст опроса с моноширинным форматированием через HTML
     """
     total = len(participants)
     now_utc = datetime.now(timezone.utc)
@@ -230,19 +232,33 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
         minutes, _ = divmod(remainder, 60)
         remaining_str = f"{hours}ч{minutes}м"
 
-    lines = [f"[{total}] {question}", f"Осталось {remaining_str}.", ""]
-
+    # Экранируем для HTML
+    question_escaped = html.escape(question)
+    
+    # Формируем текст с моноширинным шрифтом через <code> тег
+    lines = []
+    lines.append(f"<b>{question_escaped}</b>")
+    lines.append(f"⏰ Осталось: <code>{html.escape(remaining_str)}</code>")
+    lines.append(f"Участники: <code>[{total}]</code>")
+    lines.append("")
+    
     if participants:
         for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
+            fullname_escaped = html.escape(fullname)
+            
             if username:
-                lines.append(f"{idx}. @{username} {fullname}")
+                username_escaped = html.escape(username)
+                # Обернем всю строку в <code> для моноширинного шрифта
+                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
             else:
-                lines.append(f"{idx}. {fullname}")
+                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
     else:
-        lines.append("Пока нет участников.")
+        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
+        lines.append("<code>Пока нет участников</code>")
 
     return "\n".join(lines)
+
 
 async def active_poll_updater():
     """
@@ -267,7 +283,8 @@ async def active_poll_updater():
                             chat_id=chat_id, 
                             message_id=message_id, 
                             text=text,
-                            reply_markup=build_poll_keyboard()
+                            reply_markup=build_poll_keyboard(),
+                            parse_mode="HTML"
                         )
                         info["last_text"] = text
                     except TelegramBadRequest as e:
@@ -275,9 +292,10 @@ async def active_poll_updater():
                             pass
                         elif "message to edit not found" in str(e):
                             logger.warning(f"Message not found in updater: chat_id={chat_id}, message_id={message_id}")
-                            # Если сообщение не найдено, снимаем опрос с активного
                             if chat_id in active_poll:
                                 del active_poll[chat_id]
+                        elif "query is too old" in str(e):
+                            logger.warning(f"Old callback query during updater: {e}")
                         else:
                             logger.warning(
                                 "Failed to update poll message with timer chat=%s message=%s: %s",
@@ -288,6 +306,9 @@ async def active_poll_updater():
 
         await asyncio.sleep(30)
 
+
+
+
 async def edit_poll_message(chat_id, message_id, question, participants, expires_at):
     if chat_id not in active_poll:
         return
@@ -295,14 +316,15 @@ async def edit_poll_message(chat_id, message_id, question, participants, expires
     text = build_poll_text_with_timer(question, participants, expires_at)
     last_text = active_poll[chat_id].get("last_text")
     if text == last_text:
-        return  # текст не изменился, не обновляем
+        return
         
     try:
         await bot.edit_message_text(
             chat_id=chat_id, 
             message_id=message_id, 
             text=text,
-            reply_markup=build_poll_keyboard()
+            reply_markup=build_poll_keyboard(),
+            parse_mode="HTML"
         )
         active_poll[chat_id]["last_text"] = text
     except TelegramBadRequest as e:
@@ -312,6 +334,8 @@ async def edit_poll_message(chat_id, message_id, question, participants, expires
             logger.warning(f"Message not found in edit_poll_message: chat_id={chat_id}, message_id={message_id}")
             if chat_id in active_poll:
                 del active_poll[chat_id]
+        elif "query is too old" in str(e):
+            logger.warning(f"Old callback query during message edit: {e}")
         else:
             logger.warning(
                 "Failed to edit poll message chat=%s message=%s: %s", chat_id, message_id, e
@@ -412,7 +436,8 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
     sent = await bot.send_message(
         chat_id, 
         text, 
-        reply_markup=build_poll_keyboard()
+        reply_markup=build_poll_keyboard(),
+        parse_mode="HTML"  # Добавляем parse_mode
     )
     message_id = sent.message_id
 
@@ -476,40 +501,60 @@ async def deactivate_poll(chat_id: int, reason="manual"):
     question = find_command_settings(chat_id, info["command"]).get("question", "Опрос завершён")
     participants = info.get("participants", [])
     total = len(participants)
-    lines = [f"[{total}] {question} (ЗАКРЫТ)", ""]
+    
+    # Экранируем для HTML
+    question_escaped = html.escape(question)
+    
+    # Формируем текст для завершенного опроса
+    lines = []
+    lines.append(f"<b>{question_escaped} - ЗАКРЫТ</b>")
+    lines.append(f"Участники: <code>[{total}]</code>")
+    lines.append("")
+    
     if participants:
         for idx, p in enumerate(participants, start=1):
             uid, username, fullname = p
+            fullname_escaped = html.escape(fullname)
+            
             if username:
-                lines.append(f"{idx}. @{username} — {fullname}")
+                username_escaped = html.escape(username)
+                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
             else:
-                lines.append(f"{idx}. {fullname}")
+                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
     else:
-        lines.append("Никто не записался.")
+        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
+        lines.append("<code>Никто не записался</code>")
 
     new_text = "\n".join(lines)
+    
     last_text = info.get("last_text")
     if new_text != last_text:
         try:
-            # Убираем клавиатуру при деактивации
             await bot.edit_message_text(
                 chat_id=str(chat_id), 
                 message_id=message_id, 
                 text=new_text,
-                reply_markup=None
+                reply_markup=None,
+                parse_mode="HTML"
             )
             info["last_text"] = new_text
             edit_ok = True
         except TelegramBadRequest as e:
             if "message is not modified" in str(e):
-                edit_ok = True  # текст совпадает, считаем, что редактирование прошло успешно
+                edit_ok = True
+            elif "message to edit not found" in str(e):
+                logger.warning(f"Message not found when closing poll: chat_id={chat_id}, message_id={message_id}")
+                edit_ok = False
+            elif "query is too old" in str(e):
+                logger.warning(f"Old callback query during deactivation: {e}")
+                edit_ok = False
             else:
                 edit_ok = False
                 logger.warning(
                     "Failed to edit message when closing poll chat=%s message=%s: %s", chat_id, message_id, e
                 )
     else:
-        edit_ok = True  # текст не изменился, обновлять не нужно — считаем успехом
+        edit_ok = True
 
     pinned_value = False if unpin_success else bool(info.get("pinned", False))
     update_history_entry(chat_id, message_id,
@@ -527,8 +572,6 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
     logger.info("Deactivated poll in %s (%s). unpin_success=%s pinned_value=%s", chat_id, reason, unpin_success, pinned_value)
     return True
-
-
 # --- Handlers --- #
 
 # Глобальная переменная для хранения состояния
@@ -537,6 +580,8 @@ stat_waiting_username = {}
 
 # Добавим словарь для отслеживания последнего callback от пользователя
 user_last_callback = {}
+
+
 
 # Улучшенный обработчик инлайн-кнопок опроса
 @dp.callback_query(F.data.startswith("poll_"))
@@ -551,7 +596,13 @@ async def poll_button_handler(callback: CallbackQuery):
     current_time = datetime.now(timezone.utc).timestamp()
     last_callback_time = user_last_callback.get(uid, 0)
     if current_time - last_callback_time < 1:  # Не чаще 1 раза в секунду
-        await callback.answer("Подождите немного перед следующим действием", show_alert=False)
+        try:
+            await callback.answer("Подождите немного перед следующим действием", show_alert=False)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
     
     user_last_callback[uid] = current_time
@@ -559,13 +610,25 @@ async def poll_button_handler(callback: CallbackQuery):
     # Проверяем, есть ли активный опрос
     info = active_poll.get(chat_id)
     if not info:
-        await callback.answer("Опрос не активен", show_alert=True)
+        try:
+            await callback.answer("Опрос не активен", show_alert=True)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
         
     # Проверяем, не истек ли опрос
     expires_at = info.get("expires_at")
     if expires_at and datetime.now(timezone.utc) >= expires_at:
-        await callback.answer("Опрос уже завершен", show_alert=True)
+        try:
+            await callback.answer("Опрос уже завершен", show_alert=True)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
     
     participants = info.get("participants", [])
@@ -578,19 +641,48 @@ async def poll_button_handler(callback: CallbackQuery):
             participants.append((uid, username, fullname))
             changed = True
             action_performed = True
-            await callback.answer("Вы добавлены в список участников")
+            try:
+                await callback.answer("Вы добавлены в список участников")
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    # Откатываем изменения, если запрос устарел
+                    participants.remove((uid, username, fullname))
+                    return
+                else:
+                    raise
         else:
-            await callback.answer("Вы уже в списке участников")
+            try:
+                await callback.answer("Вы уже в списке участников")
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
             
     elif callback.data == "poll_leave":
         if user_in_list:
+            # Сохраняем участника для возможного отката
+            participant_to_remove = next(p for p in participants if p[0] == uid)
             participants[:] = [p for p in participants if p[0] != uid]
             changed = True
             action_performed = True
-            await callback.answer("Вы удалены из списка участников")
+            try:
+                await callback.answer("Вы удалены из списка участников")
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    # Откатываем изменения, если запрос устарел
+                    participants.append(participant_to_remove)
+                    return
+                else:
+                    raise
         else:
-            # ИСПРАВЛЕНО: используем answer вместо alert
-            await callback.answer("Вас нет в списке участников")
+            try:
+                await callback.answer("Вас нет в списке участников")
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
     
     # Обновляем сообщение только если произошли реальные изменения
     if changed and action_performed:
@@ -606,7 +698,8 @@ async def poll_button_handler(callback: CallbackQuery):
                 chat_id=chat_id,
                 message_id=info["message_id"],
                 text=new_text,
-                reply_markup=build_poll_keyboard()
+                reply_markup=build_poll_keyboard(),
+                parse_mode="HTML"
             )
             # Сохраняем новый текст
             if "last_text" not in info or info["last_text"] != new_text:
@@ -614,10 +707,11 @@ async def poll_button_handler(callback: CallbackQuery):
                 
         except TelegramBadRequest as e:
             if "message is not modified" in str(e):
-                # Игнорируем, если сообщение не изменилось
                 pass
             elif "message to edit not found" in str(e):
                 logger.warning(f"Message not found: chat_id={chat_id}, message_id={info['message_id']}")
+            elif "query is too old" in str(e):
+                logger.warning(f"Old callback query during message edit: {e}")
             else:
                 logger.warning(f"Failed to update poll message: {e}")
         
@@ -625,18 +719,31 @@ async def poll_button_handler(callback: CallbackQuery):
         update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
 
-# Добавьте обработчик команды /stat
+
+
 @dp.message(Command(commands=["stat"]))
 async def stat_cmd(message: Message):
     # Проверяем, что команда вызвана в личном чате
     if message.chat.type != "private":
-        await message.reply("Эта команда доступна только в личном чате с ботом.")
+        try:
+            await message.reply("Эта команда доступна только в личном чате с ботом.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
 
     # Проверяем права админа
     user_id = str(message.from_user.id)
     if user_id not in ADMIN_IDS:
-        await message.reply("У вас нет прав для использования этой команды.")
+        try:
+            await message.reply("У вас нет прав для использования этой команды.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
 
     # Собираем уникальные uid и соответствующие данные из истории
@@ -660,7 +767,13 @@ async def stat_cmd(message: Message):
                     user_data[uid]["fullname"] = fullname
 
     if not user_data:
-        await message.reply("В истории опросов нет участников.")
+        try:
+            await message.reply("В истории опросов нет участников.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
 
     # Создаем инлайн-клавиатуру с кнопками
@@ -696,7 +809,16 @@ async def stat_cmd(message: Message):
     # Сохраняем состояние ожидания выбора
     stat_waiting_username[message.from_user.id] = True
 
-    await message.reply("Выберите пользователя для фильтрации статистики:", reply_markup=reply_markup)
+    try:
+        await message.reply("Выберите пользователя для фильтрации статистики:", reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
+
+
+
 
 # Обработчик нажатий на кнопки инлайн-клавиатуры
 @dp.callback_query(F.data.startswith("stat_"))
@@ -705,7 +827,13 @@ async def stat_callback_handler(callback: CallbackQuery):
     
     # Проверяем, что пользователь ожидает выбора
     if user_id not in stat_waiting_username:
-        await callback.answer("Сессия устарела. Вызовите /stat снова.", show_alert=True)
+        try:
+            await callback.answer("Сессия устарела. Вызовите /stat снова.", show_alert=True)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
 
     # Извлекаем выбранный uid из callback_data
@@ -715,8 +843,14 @@ async def stat_callback_handler(callback: CallbackQuery):
     # Обработка кнопки "Отмена"
     if selected_uid == "cancel":
         del stat_waiting_username[user_id]
-        await callback.message.edit_text("Операция отменена.")
-        await callback.answer()
+        try:
+            await callback.message.edit_text("Операция отменена.")
+            await callback.answer()
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
 
     # Удаляем состояние ожидания
@@ -756,8 +890,14 @@ async def stat_callback_handler(callback: CallbackQuery):
             })
 
     if not data:
-        await callback.message.edit_text("Нет данных для выбранного фильтра.")
-        await callback.answer()
+        try:
+            await callback.message.edit_text("Нет данных для выбранного фильтра.")
+            await callback.answer()
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return  # Игнорируем устаревшие запросы
+            else:
+                raise
         return
 
     # Сортируем данные по expires_at, затем по command
@@ -804,20 +944,20 @@ async def stat_callback_handler(callback: CallbackQuery):
             filename = f"poll_statistics_{selected_uid}.csv"
     
     # Редактируем сообщение с клавиатурой и отправляем файл
-    await callback.message.edit_text(f"Статистика для: {display_name}")
-    
-    await callback.message.answer_document(
-        types.BufferedInputFile(csv_data, filename=filename),
-        caption=f"Статистика опросов - {display_name}"
-    )
-    
-    await callback.answer()
-
-
-
-
-
-
+    try:
+        await callback.message.edit_text(f"Статистика для: {display_name}")
+        
+        await callback.message.answer_document(
+            types.BufferedInputFile(csv_data, filename=filename),
+            caption=f"Статистика опросов - {display_name}"
+        )
+        
+        await callback.answer()
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return  # Игнорируем устаревшие запросы
+        else:
+            raise
 
 
 
@@ -828,11 +968,16 @@ async def stat_callback_handler(callback: CallbackQuery):
 async def deactivate_cmd(message: Message):
     chat_id = message.chat.id
     res = await deactivate_poll(chat_id, reason=f"manual by {message.from_user.id}")
-    if res:
-        await message.reply("Опрос закрыт.")
-    else:
-        await message.reply("Активных опросов нет.")
-
+    try:
+        if res:
+            await message.reply("Опрос закрыт.")
+        else:
+            await message.reply("Активных опросов нет.")
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
 
 
 
@@ -969,30 +1114,53 @@ def build_help_text():
 @dp.message(Command(commands=["help"]))
 async def help_cmd(message: types.Message):
     text = build_help_text()
-    sent = await message.answer(text, parse_mode="Markdown")
-    await asyncio.sleep(100)
     try:
-        await sent.delete()
-    except Exception:
-        pass
+        sent = await message.answer(text, parse_mode="Markdown")
+        await asyncio.sleep(100)
+        try:
+            await sent.delete()
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
 
 # --- Универсальный хэндлер для ручных опросов --- #
 # Список команд, для которых есть отдельные хэндлеры
 EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5"}
+
+
+
 @dp.message(Command(commands=["top5"]))
 async def top5_cmd(message: Message):
-    # 'Bot' object has no attribute 'username' - используем get_me() для получения информации о боте
     chat_id = message.chat.id
     
     # Проверяем, что команда вызвана в групповом чате
     if message.chat.type not in ["group", "supergroup"]:
-        await message.answer("Эта команда доступна только в групповых чатах.")
+        try:
+            await message.answer("Эта команда доступна только в групповых чатах.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
     
     # Проверяем права админа
     user_id = str(message.from_user.id)
     if user_id not in ADMIN_IDS:
-        await message.answer("У вас нет прав для использования этой команды.")
+        try:
+            await message.answer("У вас нет прав для использования этой команды.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
     
     # Вычисляем дату два месяца назад
@@ -1077,7 +1245,13 @@ async def top5_cmd(message: Message):
     
     # Формируем сообщение с результатами
     if not top_5:
-        await message.answer("За последние 2 месяцев нет данных о тренировках с 4+ участниками.")
+        try:
+            await message.answer("За последние 2 месяцев нет данных о тренировках с 4+ участниками.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
     
     lines = ["🏆 ТОП-5 самых активных участников за последние 2 месяца:\n"]
@@ -1093,7 +1267,15 @@ async def top5_cmd(message: Message):
     result_text = "\n".join(lines)
     
     # Просто отправляем сообщение
-    await message.answer(result_text)
+    try:
+        await message.answer(result_text)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
+
+
 
 
 @dp.message(F.text.startswith("/"))
@@ -1122,14 +1304,24 @@ async def universal_command_handler(message: types.Message):
     cmd_settings = find_command_settings(chat_id, cmd_name)
     if not cmd_settings:
         # Исправляем получение username бота
-        bot_info = await bot.get_me()
-        logger.info("No settings for command %s@%s in chat %s", cmd_name, bot_info.username, chat_id)
+        try:
+            bot_info = await bot.get_me()
+            logger.info("No settings for command %s@%s in chat %s", cmd_name, bot_info.username, chat_id)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
         return
 
     # Создаём опрос вручную
-    await create_poll(chat_id, cmd_name)
-
-
+    try:
+        await create_poll(chat_id, cmd_name)
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
 
 async def main():
     load_history()
