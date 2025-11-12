@@ -1878,46 +1878,71 @@ async def universal_command_handler(message: types.Message):
 
 @dp.message(F.text)
 async def handle_edit_link(message: Message):
-    if (message.from_user.id not in edit_waiting_for_link or 
-        not edit_waiting_for_link[message.from_user.id]):
+    user_id = message.from_user.id
+    logger.info(f"📨 Received text message from user {user_id} in chat {message.chat.type}: '{message.text}'")
+    
+    # Проверяем, что сообщение в личном чате И пользователь ожидает ссылку
+    if message.chat.type != "private":
+        logger.debug(f"Message not in private chat, ignoring. Chat type: {message.chat.type}")
+        return
+        
+    if user_id not in edit_waiting_for_link or not edit_waiting_for_link[user_id]:
+        logger.debug(f"User {user_id} is not waiting for link, ignoring message")
         return
 
+    logger.info(f"✅ User {user_id} is waiting for link, processing...")
+    
     # Сбрасываем состояние ожидания
-    edit_waiting_for_link[message.from_user.id] = False
+    edit_waiting_for_link[user_id] = False
+    logger.debug(f"Reset waiting state for user {user_id}")
 
+    # Проверяем, что сообщение действительно похоже на ссылку
+    link = message.text.strip()
+    if not link.startswith(('http://', 'https://', 't.me/')):
+        logger.warning(f"Message doesn't look like a link: {link}")
+        try:
+            await message.reply("Это не похоже на ссылку. Пожалуйста, пришлите ссылку на опрос в формате: https://t.me/c/...")
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
+        return
+
+    logger.info(f"🔗 Processing link: {link}")
+    
     # Извлекаем ID из ссылки
-    chat_id, message_id = extract_ids_from_link(message.text)
+    chat_id, message_id = extract_ids_from_link(link)
+    logger.info(f"📋 Extracted IDs - chat_id: {chat_id}, message_id: {message_id}")
     
     if not chat_id or not message_id:
+        logger.warning(f"❌ Failed to extract IDs from link: {link}")
         try:
-            await message.reply("Не удалось извлечь данные из ссылки. Убедитесь, что ссылка правильная.")
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e):
-                return
-            else:
-                raise
+            await message.reply("Не удалось извлечь данные из ссылки. Убедитесь, что ссылка правильная. Пример: https://t.me/c/1570728084/1/3110")
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
         return
 
+    logger.info(f"🔍 Looking for poll in history: chat_id={chat_id}, message_id={message_id}")
+    
     # Ищем опрос в истории
     poll_entry = find_poll_in_history(chat_id, message_id)
     if not poll_entry:
+        logger.warning(f"❌ Poll not found in history for chat_id={chat_id}, message_id={message_id}")
         try:
             await message.reply("Опрос не найден в истории.")
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e):
-                return
-            else:
-                raise
+        except Exception as e:
+            logger.error(f"Failed to send 'not found' message: {e}")
         return
 
+    logger.info(f"✅ Poll found: {poll_entry.get('command', 'Unknown')}")
+    
     # Создаем сессию редактирования
-    edit_sessions[message.from_user.id] = {
+    edit_sessions[user_id] = {
         "chat_id": chat_id,
         "message_id": message_id,
         "poll_entry": poll_entry,
         "last_action_time": datetime.now(timezone.utc),
         "private_message_id": None
     }
+    logger.info(f"📝 Created edit session for user {user_id}")
 
     # Формируем текст с списком участников
     participants = _deserialize_participants(poll_entry.get("participants", []))
@@ -1927,18 +1952,15 @@ async def handle_edit_link(message: Message):
     
     try:
         sent_message = await message.reply(text, reply_markup=build_edit_keyboard(), parse_mode="HTML")
-        edit_sessions[message.from_user.id]["private_message_id"] = sent_message.message_id
+        edit_sessions[user_id]["private_message_id"] = sent_message.message_id
+        logger.info(f"📤 Sent edit interface to user {user_id}, message_id: {sent_message.message_id}")
         
         # Запускаем таймер сессии
-        asyncio.create_task(edit_session_timer(message.from_user.id))
+        asyncio.create_task(edit_session_timer(user_id))
+        logger.info(f"⏰ Started session timer for user {user_id}")
         
-    except TelegramBadRequest as e:
-        if "query is too old" in str(e):
-            return
-        else:
-            raise
-
-
+    except Exception as e:
+        logger.error(f"❌ Failed to send edit interface to user {user_id}: {e}")
 
 
 async def main():
