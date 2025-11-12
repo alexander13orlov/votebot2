@@ -23,6 +23,8 @@ from datetime import datetime
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 import html
+import re
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,6 +32,10 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent
 SETTINGS_PATH = DATA_DIR / "settings.json"
 HISTORY_PATH = DATA_DIR / "polls_history.json"  # файл для хранения последних 100 опросов
+
+edit_sessions = {}  # {admin_id: session_data}
+edit_waiting_for_link = {}  # {admin_id: True/False}
+
 
 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
     SETTINGS = json.load(f)
@@ -572,15 +578,569 @@ async def deactivate_poll(chat_id: int, reason="manual"):
 
     logger.info("Deactivated poll in %s (%s). unpin_success=%s pinned_value=%s", chat_id, reason, unpin_success, pinned_value)
     return True
-# --- Handlers --- #
+
+
+
+
+# Функция для извлечения chat_id и message_id из ссылки
+def extract_ids_from_link(link: str) -> tuple[Optional[int], Optional[int]]:
+    logger.debug(f"🔍 Extracting IDs from link: {link}")
+    try:
+        parsed = urlparse(link)
+        path_parts = parsed.path.split('/')
+        
+        if '/c/' in link:
+            c_index = path_parts.index('c')
+            if len(path_parts) > c_index + 3:
+                chat_id = int(path_parts[c_index + 1])
+                message_id = int(path_parts[c_index + 3])
+                
+                # Определяем тип чата по длине chat_id
+                # Обычно супергруппы имеют 10-значные ID в ссылках
+                if len(str(chat_id)) == 10:
+                    # Это супергруппа - добавляем префикс -100
+                    chat_id_with_prefix = int(f"-100{chat_id}")
+                else:
+                    # Это обычная группа или канал
+                    chat_id_with_prefix = chat_id
+                
+                logger.debug(f"✅ Successfully extracted: chat_id={chat_id_with_prefix}, message_id={message_id}")
+                return chat_id_with_prefix, message_id
+                
+    except (ValueError, IndexError, AttributeError) as e:
+        logger.error(f"❌ Error extracting IDs from link '{link}': {e}")
+    
+    return None, None
+
+
+
+
+
+# Функция для поиска опроса в истории
+def find_poll_in_history(chat_id: int, message_id: int) -> Optional[dict]:
+    logger.debug(f"🔍 Searching in history: {len(history)} entries")
+    for idx, entry in enumerate(history):
+        entry_chat_id = int(entry.get("chat_id"))
+        entry_message_id = int(entry.get("message_id"))
+        logger.debug(f"  Entry {idx}: chat_id={entry_chat_id}, message_id={entry_message_id}")
+        
+        if entry_chat_id == chat_id and entry_message_id == message_id:
+            logger.debug(f"✅ Found match at index {idx}")
+            return entry
+    
+    logger.debug(f"❌ No match found for chat_id={chat_id}, message_id={message_id}")
+    return None
+
+# Функция для получения уникальных пользователей из истории
+def get_unique_users_from_history() -> List[tuple]:
+    unique_users = {}
+    for entry in history:
+        for participant in entry.get("participants", []):
+            uid = participant.get("uid")
+            if uid and uid not in unique_users:
+                unique_users[uid] = (
+                    uid,
+                    participant.get("username"),
+                    participant.get("fullname", "")
+                )
+    return list(unique_users.values())
+
+# Функция для построения клавиатуры редактирования
+def build_edit_keyboard() -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="edit_add"),
+            InlineKeyboardButton(text="➖ Удалить", callback_data="edit_remove"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Завершить", callback_data="edit_finish")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# Функция для построения клавиатуры с пользователями для удаления
+def build_remove_user_keyboard(participants: List[tuple]) -> InlineKeyboardMarkup:
+    keyboard = []
+    for uid, username, fullname in participants:
+        display_name = f"@{username}" if username else fullname
+        if len(display_name) > 30:
+            display_name = display_name[:30] + "..."
+        keyboard.append([
+            InlineKeyboardButton(
+                text=display_name, 
+                callback_data=f"edit_remove_{uid}"
+            )
+        ])
+    keyboard.append([
+        InlineKeyboardButton(text="↩️ Назад", callback_data="edit_back")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# Функция для построения клавиатуры с пользователями для добавления
+def build_add_user_keyboard(available_users: List[tuple]) -> InlineKeyboardMarkup:
+    keyboard = []
+    for uid, username, fullname in available_users:
+        display_name = f"@{username}" if username else fullname
+        if len(display_name) > 30:
+            display_name = display_name[:30] + "..."
+        keyboard.append([
+            InlineKeyboardButton(
+                text=display_name, 
+                callback_data=f"edit_add_{uid}"
+            )
+        ])
+    keyboard.append([
+        InlineKeyboardButton(text="↩️ Назад", callback_data="edit_back")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+# Таймер сессии редактирования (1 минута)
+async def edit_session_timer(admin_id: int):
+    await asyncio.sleep(60)  # 1 минута
+    
+    if admin_id in edit_sessions:
+        session = edit_sessions[admin_id]
+        time_since_last_action = datetime.now(timezone.utc) - session["last_action_time"]
+        
+        if time_since_last_action.total_seconds() >= 60:
+            try:
+                await bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=session["private_message_id"],
+                    text="Сессия редактирования завершена по таймауту.",
+                    reply_markup=None
+                )
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e) or "message to edit not found" in str(e):
+                    pass
+                else:
+                    logger.warning(f"Failed to edit message in session timer: {e}")
+            
+            del edit_sessions[admin_id]
+
+# Обновляем время действия в сессии
+def update_session_time(admin_id: int):
+    if admin_id in edit_sessions:
+        edit_sessions[admin_id]["last_action_time"] = datetime.now(timezone.utc)
+
+
+
+# Функция для обновления сообщения опроса
+async def update_poll_message(chat_id: int, message_id: int, poll_entry: dict, participants: List[tuple]) -> bool:
+    try:
+        # Определяем, активен ли опрос
+        is_active = poll_entry.get("active", False)
+        command = poll_entry.get("command", "")
+        question = find_command_settings(chat_id, command).get("question", command) if find_command_settings(chat_id, command) else command
+        
+        if is_active:
+            # Активный опрос - используем формат с таймером
+            expires_at_str = poll_entry.get("expires_at")
+            if expires_at_str:
+                expires_at = datetime.fromisoformat(expires_at_str)
+            else:
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=1)  # fallback
+            
+            text = build_poll_text_with_timer(question, participants, expires_at)
+            
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=build_poll_keyboard(),
+                parse_mode="HTML"
+            )
+        else:
+            # Закрытый опрос
+            text = build_closed_poll_text(question, participants)
+            
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML"
+            )
+        
+        return True
+        
+    except TelegramBadRequest as e:
+        if "message to edit not found" in str(e) or "message is not modified" in str(e):
+            return False
+        elif "query is too old" in str(e):
+            return False
+        else:
+            logger.warning(f"Failed to update poll message during edit: {e}")
+            return False
+
+# Функция для построения текста закрытого опроса
+def build_closed_poll_text(question: str, participants: List[tuple]) -> str:
+    total = len(participants)
+    
+    # Экранируем для HTML
+    question_escaped = html.escape(question)
+    
+    lines = []
+    lines.append(f"<b>{question_escaped} - ЗАКРЫТ</b>")
+    lines.append(f"Участники: <code>[{total}]</code>")
+    lines.append("")
+    
+    if participants:
+        for idx, p in enumerate(participants, start=1):
+            uid, username, fullname = p
+            fullname_escaped = html.escape(fullname)
+            
+            if username:
+                username_escaped = html.escape(username)
+                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
+            else:
+                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
+    else:
+        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
+        lines.append("<code>Никто не записался</code>")
+
+    return "\n".join(lines)
+
+def build_edit_poll_text(question: str, participants: List[tuple]) -> str:
+    """
+    Формирует текст для интерфейса редактирования опроса
+    """
+    total = len(participants)
+    
+    # Экранируем для HTML
+    question_escaped = html.escape(question)
+    
+    lines = []
+    lines.append(f"<b>Редактирование опроса: {question_escaped}</b>")
+    lines.append(f"Участников: <code>[{total}]</code>")
+    lines.append("")
+    
+    if participants:
+        for idx, p in enumerate(participants, start=1):
+            uid, username, fullname = p
+            fullname_escaped = html.escape(fullname)
+            
+            if username:
+                username_escaped = html.escape(username)
+                lines.append(f"<code>{idx:2d}. @{username_escaped} - {fullname_escaped}</code>")
+            else:
+                lines.append(f"<code>{idx:2d}. {fullname_escaped}</code>")
+    else:
+        lines.append("<code>┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄</code>")
+        lines.append("<code>Пока нет участников</code>")
+
+    lines.append("")
+    lines.append("Выберите действие:")
+    
+    return "\n".join(lines)
+
+
+
+
+
+
+
+# ---------------------------------------------------- Handlers ------------------------------------------------------ #
+
 
 # Глобальная переменная для хранения состояния
 stat_waiting_username = {}
-
-
 # Добавим словарь для отслеживания последнего callback от пользователя
 user_last_callback = {}
 
+
+
+# Обработчик callback'ов редактирования
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit_callback_handler(callback: CallbackQuery):
+    admin_id = callback.from_user.id
+    
+    # Проверяем активную сессию
+    if admin_id not in edit_sessions:
+        try:
+            await callback.answer("Сессия редактирования завершена.", show_alert=True)
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+        return
+
+    update_session_time(admin_id)
+    data = callback.data
+    session = edit_sessions[admin_id]
+    poll_entry = session["poll_entry"]
+    participants = _deserialize_participants(poll_entry.get("participants", []))
+
+    if data == "edit_finish":
+        # Завершаем сессию
+        try:
+            await callback.message.edit_text(
+                "Редактирование завершено.",
+                reply_markup=None
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in edit finish: {e}")
+        
+        del edit_sessions[admin_id]
+        await callback.answer()
+        return
+
+    elif data == "edit_back":
+        # Возвращаемся к основному меню
+        participants = _deserialize_participants(poll_entry.get("participants", []))
+        question = poll_entry.get("command", "Опрос")
+        text = build_edit_poll_text(question, participants)
+        
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=build_edit_keyboard(),
+                parse_mode="HTML"
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in edit back: {e}")
+        
+        await callback.answer()
+        return
+
+    elif data == "edit_remove":
+        # Показываем список участников для удаления
+        if not participants:
+            try:
+                await callback.answer("В опросе нет участников для удаления.", show_alert=True)
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
+            return
+
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=build_remove_user_keyboard(participants)
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in edit remove: {e}")
+        
+        await callback.answer()
+        return
+
+    elif data == "edit_add":
+        # Показываем список пользователей для добавления
+        all_users = get_unique_users_from_history()
+        current_uids = [p[0] for p in participants]
+        available_users = [user for user in all_users if user[0] not in current_uids]
+        
+        if not available_users:
+            try:
+                await callback.answer("Нет доступных пользователей для добавления.", show_alert=True)
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
+            return
+
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=build_add_user_keyboard(available_users)
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in edit add: {e}")
+        
+        await callback.answer()
+        return
+
+    elif data.startswith("edit_remove_"):
+        # Удаляем пользователя
+        uid = int(data.split("_")[2])
+        
+        # Находим пользователя
+        user_to_remove = None
+        for user in participants:
+            if user[0] == uid:
+                user_to_remove = user
+                break
+        
+        if not user_to_remove:
+            try:
+                await callback.answer("Пользователь не найден в опросе.", show_alert=True)
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
+            return
+
+        # Удаляем пользователя из опроса
+        new_participants = [p for p in participants if p[0] != uid]
+        poll_entry["participants"] = _serialize_participants(new_participants)
+        
+        # Обновляем сообщение в чате (если возможно)
+        success = await update_poll_message(
+            session["chat_id"], 
+            session["message_id"], 
+            poll_entry, 
+            new_participants
+        )
+        
+        # Обновляем историю
+        update_history_entry(
+            session["chat_id"], 
+            session["message_id"],
+            participants=_serialize_participants(new_participants)
+        )
+        
+        # Возвращаемся к основному меню
+        participants_count = len(new_participants)
+        question = poll_entry.get("command", "Опрос")
+        # Формируем текст с обновленным списком участников
+        text = build_edit_poll_text(question, new_participants)
+        
+ 
+        if success:
+            text += f"\n\n✅ Пользователь удален. Сообщение в чате обновлено."
+        else:
+            text += f"\n\n✅ Пользователь удален из истории. Не удалось обновить сообщение в чате (прошло более 48 часов)."
+        
+        text += "\n\nВыберите действие:"
+        
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=build_edit_keyboard(),
+                parse_mode="HTML"
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in remove user: {e}")
+        
+        await callback.answer()
+        return
+
+    elif data.startswith("edit_add_"):
+        # Добавляем пользователя
+        uid = int(data.split("_")[2])
+        
+        # Находим пользователя в истории
+        user_to_add = None
+        all_users = get_unique_users_from_history()
+        for user in all_users:
+            if user[0] == uid:
+                user_to_add = user
+                break
+        
+        if not user_to_add:
+            try:
+                await callback.answer("Пользователь не найден в истории.", show_alert=True)
+            except TelegramBadRequest as e:
+                if "query is too old" in str(e):
+                    return
+                else:
+                    raise
+            return
+
+        # Добавляем пользователя в опрос
+        new_participants = participants + [user_to_add]
+        poll_entry["participants"] = _serialize_participants(new_participants)
+        
+        # Обновляем сообщение в чате (если возможно)
+        success = await update_poll_message(
+            session["chat_id"], 
+            session["message_id"], 
+            poll_entry, 
+            new_participants
+        )
+        
+        # Обновляем историю
+        update_history_entry(
+            session["chat_id"], 
+            session["message_id"],
+            participants=_serialize_participants(new_participants)
+        )
+        
+        # Возвращаемся к основному меню
+        participants_count = len(new_participants)
+        question = poll_entry.get("command", "Опрос")
+        # Формируем текст с обновленным списком участников
+        text = build_edit_poll_text(question, new_participants)
+        
+        if success:
+            text += f"\n\n✅ Пользователь добавлен. Сообщение в чате обновлено."
+        else:
+            text += f"\n\n✅ Пользователь добавлен в историю. Не удалось обновить сообщение в чате (прошло более 48 часов)."
+        
+        text += "\n\nВыберите действие:"
+        
+        try:
+            await callback.message.edit_text(
+                text,
+                reply_markup=build_edit_keyboard(),
+                parse_mode="HTML"
+            )
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                logger.warning(f"Failed to edit message in add user: {e}")
+        
+        await callback.answer()
+        return
+
+
+@dp.message(Command(commands=["edit"]))
+async def edit_cmd(message: Message):
+    user_id = message.from_user.id
+    logger.info(f"🎯 Edit command received from user {user_id}")
+    
+    # Проверяем, что команда в личном чате
+    if message.chat.type != "private":
+        logger.warning(f"❌ Edit command used in non-private chat: {message.chat.type}")
+        try:
+            await message.reply("Эта команда доступна только в личном чате с ботом.")
+        except Exception as e:
+            logger.error(f"Failed to send private chat warning: {e}")
+        return
+
+    # Проверяем права админа
+    user_id_str = str(user_id)
+    if user_id_str not in ADMIN_IDS:
+        logger.warning(f"❌ User {user_id} is not in ADMIN_IDS")
+        try:
+            await message.reply("У вас нет прав для использования этой команды.")
+        except Exception as e:
+            logger.error(f"Failed to send admin rights warning: {e}")
+        return
+
+    # Показываем доступные опросы для отладки
+    logger.info(f"📊 Available polls in history:")
+    for idx, entry in enumerate(history[:5]):  # Показываем первые 5
+        logger.info(f"  {idx}: chat_id={entry.get('chat_id')}, message_id={entry.get('message_id')}, command={entry.get('command')}")
+
+    # Устанавливаем состояние ожидания ссылки
+    edit_waiting_for_link[user_id] = True
+    logger.info(f"✅ Set waiting_for_link=True for user {user_id}")
+    
+    try:
+        await message.reply("Пришлите ссылку на опрос. Пример: https://t.me/c/1570728084/1/3110")
+        logger.info(f"📤 Sent link request to user {user_id}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send link request to user {user_id}: {e}")
 
 
 # Улучшенный обработчик инлайн-кнопок опроса
@@ -719,8 +1279,6 @@ async def poll_button_handler(callback: CallbackQuery):
         update_history_entry(chat_id, info["message_id"], participants=_serialize_participants(participants))
 
 
-
-
 @dp.message(Command(commands=["stat"]))
 async def stat_cmd(message: Message):
     # Проверяем, что команда вызвана в личном чате
@@ -816,8 +1374,6 @@ async def stat_cmd(message: Message):
             return
         else:
             raise
-
-
 
 
 # Обработчик нажатий на кнопки инлайн-клавиатуры
@@ -959,10 +1515,6 @@ async def stat_callback_handler(callback: CallbackQuery):
         else:
             raise
 
-
-
-
-# ------------------------------------------
 
 @dp.message(Command(commands=["deactivate"]))
 async def deactivate_cmd(message: Message):
@@ -1130,9 +1682,9 @@ async def help_cmd(message: types.Message):
         else:
             raise
 
-# --- Универсальный хэндлер для ручных опросов --- #
+
 # Список команд, для которых есть отдельные хэндлеры
-EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5"}
+EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5", "edit"}
 
 
 
@@ -1277,7 +1829,7 @@ async def top5_cmd(message: Message):
 
 
 
-
+# --- Универсальный хэндлер для ручных опросов --- #
 @dp.message(F.text.startswith("/"))
 async def universal_command_handler(message: types.Message):
     chat_id = message.chat.id
@@ -1322,6 +1874,72 @@ async def universal_command_handler(message: types.Message):
             return
         else:
             raise
+
+
+@dp.message(F.text)
+async def handle_edit_link(message: Message):
+    if (message.from_user.id not in edit_waiting_for_link or 
+        not edit_waiting_for_link[message.from_user.id]):
+        return
+
+    # Сбрасываем состояние ожидания
+    edit_waiting_for_link[message.from_user.id] = False
+
+    # Извлекаем ID из ссылки
+    chat_id, message_id = extract_ids_from_link(message.text)
+    
+    if not chat_id or not message_id:
+        try:
+            await message.reply("Не удалось извлечь данные из ссылки. Убедитесь, что ссылка правильная.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+        return
+
+    # Ищем опрос в истории
+    poll_entry = find_poll_in_history(chat_id, message_id)
+    if not poll_entry:
+        try:
+            await message.reply("Опрос не найден в истории.")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+        return
+
+    # Создаем сессию редактирования
+    edit_sessions[message.from_user.id] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "poll_entry": poll_entry,
+        "last_action_time": datetime.now(timezone.utc),
+        "private_message_id": None
+    }
+
+    # Формируем текст с списком участников
+    participants = _deserialize_participants(poll_entry.get("participants", []))
+    question = poll_entry.get("command", "Опрос")
+    
+    text = build_edit_poll_text(question, participants)
+    
+    try:
+        sent_message = await message.reply(text, reply_markup=build_edit_keyboard(), parse_mode="HTML")
+        edit_sessions[message.from_user.id]["private_message_id"] = sent_message.message_id
+        
+        # Запускаем таймер сессии
+        asyncio.create_task(edit_session_timer(message.from_user.id))
+        
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e):
+            return
+        else:
+            raise
+
+
+
 
 async def main():
     load_history()
