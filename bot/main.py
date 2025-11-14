@@ -221,6 +221,37 @@ def update_history_entry(chat_id: int, message_id: int, **updates):
         logger.warning("History entry not found for update: chat=%s message=%s updates=%s", chat_id, message_id, updates)
 
 
+def format_participant_line(idx: int, participant: tuple) -> str:
+    """
+    Форматирует строку участника для отображения в опросе
+    """
+    uid, username, fullname = participant
+    fullname_escaped = html.escape(fullname)
+    
+    # Специальная обработка для определенного пользователя
+    if uid == 409915077:
+        username_display = 'A girl has no username'
+    else:
+        username_display = f"@{html.escape(username)}" if username else 'None'
+    
+    return f"{idx:2d}. {username_display} - {fullname_escaped}"
+
+
+def build_participants_section(participants: List[tuple], empty_message: str) -> List[str]:
+    """
+    Формирует секцию с участниками для опроса
+    """
+    lines = []
+    
+    if participants:
+        for idx, participant in enumerate(participants, start=1):
+            lines.append(format_participant_line(idx, participant))
+    else:
+        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
+        lines.append(empty_message)
+    
+    return lines
+
 
 
 def build_poll_text_with_timer(question: str, participants: List[tuple], expires_at: datetime) -> str:
@@ -238,27 +269,14 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
         minutes, _ = divmod(remainder, 60)
         remaining_str = f"{hours}ч{minutes}м"
 
-    # Экранируем для HTML
     question_escaped = html.escape(question)
     
-    # Формируем текст с комбинированным форматированием
     lines = []
     lines.append(f"<b>{question_escaped}</b>")
     lines.append(f"⏰ Осталось: <code>{html.escape(remaining_str)}</code>")
     lines.append(f"Участники: <code>[{total}]</code>")
     lines.append("")
-    
-    if participants:
-        for idx, p in enumerate(participants, start=1):
-            uid, username, fullname = p
-            fullname_escaped = html.escape(fullname)
-            
-            # Всегда показываем username, даже если он None
-            username_display = f"@{html.escape(username)}" if username else "None"
-            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
-    else:
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append("Пока нет участников")
+    lines.extend(build_participants_section(participants, "Пока нет участников"))
 
     return "\n".join(lines)
 
@@ -792,26 +810,13 @@ async def update_poll_message(chat_id: int, message_id: int, poll_entry: dict, p
 # Функция для построения текста закрытого опроса
 def build_closed_poll_text(question: str, participants: List[tuple]) -> str:
     total = len(participants)
-    
-    # Экранируем для HTML
     question_escaped = html.escape(question)
     
     lines = []
     lines.append(f"<b>{question_escaped} - ЗАКРЫТ</b>")
     lines.append(f"Участники: <code>[{total}]</code>")
     lines.append("")
-    
-    if participants:
-        for idx, p in enumerate(participants, start=1):
-            uid, username, fullname = p
-            fullname_escaped = html.escape(fullname)
-            
-            # Всегда показываем username, даже если он None
-            username_display = f"@{html.escape(username)}" if username else "None"
-            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
-    else:
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append("Никто не записался")
+    lines.extend(build_participants_section(participants, "Никто не записался"))
 
     return "\n".join(lines)
 
@@ -821,27 +826,13 @@ def build_edit_poll_text(question: str, participants: List[tuple]) -> str:
     Формирует текст для интерфейса редактирования опроса
     """
     total = len(participants)
-    
-    # Экранируем для HTML
     question_escaped = html.escape(question)
     
     lines = []
     lines.append(f"<b>Редактирование опроса: {question_escaped}</b>")
     lines.append(f"Участников: <code>[{total}]</code>")
     lines.append("")
-    
-    if participants:
-        for idx, p in enumerate(participants, start=1):
-            uid, username, fullname = p
-            fullname_escaped = html.escape(fullname)
-            
-            # Всегда показываем username, даже если он None
-            username_display = f"@{html.escape(username)}" if username else "None"
-            lines.append(f"{idx:2d}. {username_display} - {fullname_escaped}")
-    else:
-        lines.append("┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄")
-        lines.append("Пока нет участников")
-
+    lines.extend(build_participants_section(participants, "Пока нет участников"))
     lines.append("")
     lines.append("Выберите действие:")
     
