@@ -560,7 +560,9 @@ async def deactivate_poll(chat_id: int, reason="manual"):
             )
             info["last_text"] = new_text
             edit_ok = True
+            logger.info(f"✅ Successfully edited poll message: chat={chat_id}, message={message_id}")
         except TelegramBadRequest as e:
+            logger.error(f"❌ Failed to edit poll message: {e}")  # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ
             if "message is not modified" in str(e):
                 edit_ok = True
             elif "message to edit not found" in str(e):
