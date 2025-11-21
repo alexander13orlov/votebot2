@@ -260,7 +260,10 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
     """
     total = len(participants)
     now_utc = datetime.now(timezone.utc)
-    remaining = expires_at - now_utc
+    
+    LAG=1 # один час запас до закрытия 
+    remaining = expires_at - timedelta(hours=LAG) - now_utc
+    # remaining = expires_at - now_utc
 
     if remaining.total_seconds() <= 0:
         remaining_str = "0ч0м"
