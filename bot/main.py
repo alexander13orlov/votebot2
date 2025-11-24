@@ -13,8 +13,9 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
-
-from .config import BOT_TOKEN, ADMIN_IDS
+from .weatherapi_async import WeatherAPI
+import os
+from .config import BOT_TOKEN, ADMIN_IDS, WEATHERAPI_KEY
 
 import csv
 import io
@@ -28,7 +29,7 @@ from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
-
+LAT, LON = 55.759931, 37.643032
 DATA_DIR = Path(__file__).parent
 SETTINGS_PATH = DATA_DIR / "settings.json"
 HISTORY_PATH = DATA_DIR / "polls_history.json"  # файл для хранения последних 100 опросов
@@ -36,6 +37,7 @@ HISTORY_PATH = DATA_DIR / "polls_history.json"  # файл для хранени
 edit_sessions = {}  # {admin_id: session_data}
 edit_waiting_for_link = {}  # {admin_id: True/False}
 
+weather_client = WeatherAPI(api_key=WEATHERAPI_KEY, lat=LAT, lon=LON, cache_ttl=300)
 
 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
     SETTINGS = json.load(f)
@@ -159,6 +161,8 @@ def load_history():
                     "pinned": bool(entry.get("pinned", False)),
                     "unpin": bool(entry.get("unpin", False)),
                     "participants": _deserialize_participants(entry.get("participants", [])),
+                    "weather_sent_on_publish": False,
+                    "weather_sent_on_expiry": False  
                 }
 
                 logger.info(
@@ -176,6 +180,24 @@ def load_history():
         history = []
         active_poll.clear()
 
+async def send_weather(chat_id: int):
+    """
+    Отправляет в чат текущую погоду и прогноз от текущего момента до конца дня (короткий режим)
+    """
+    # вычисляем диапазон часов от текущего до конца дня
+    now = datetime.now(tz=LOCAL_TZ)
+    end_hour = 23
+    hours_range = range(now.hour, end_hour + 1)
+
+    current_weather = await weather_client.format_current()
+    forecast_text = await weather_client.format_forecast(hours=hours_range, short=True)
+
+    text = f"{current_weather}\n\n{forecast_text}"
+
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"Failed to send weather to chat {chat_id}: {e}")
 
 
 def save_history():
@@ -261,12 +283,13 @@ def build_poll_text_with_timer(question: str, participants: List[tuple], expires
     total = len(participants)
     now_utc = datetime.now(timezone.utc)
     
-    LAG=1 # один час запас до закрытия 
-    remaining = expires_at - timedelta(hours=LAG) - now_utc
+    LAG=90 # один час запас до закрытия 
+    remaining = expires_at - timedelta(minutes=LAG) - now_utc
     # remaining = expires_at - now_utc
 
     if remaining.total_seconds() <= 0:
         remaining_str = "0ч0м"
+ 
     else:
         hours, remainder = divmod(int(remaining.total_seconds()), 3600)
         minutes, _ = divmod(remainder, 60)
@@ -325,6 +348,12 @@ async def active_poll_updater():
                                 "Failed to update poll message with timer chat=%s message=%s: %s",
                                 chat_id, message_id, e
                             )
+                LAG=90 #  запас до закрытия 
+                now_utc = datetime.now(timezone.utc)
+                remaining = expires_at - timedelta(minutes=LAG) - now_utc
+                if remaining.total_seconds() <= 0 and not info.get("weather_sent_on_expiry"):
+                    await send_weather(chat_id)
+                    info["weather_sent_on_expiry"] = True            
         except Exception as e:
             logger.exception("Error in active_poll_updater: %s", e)
 
@@ -482,6 +511,9 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         "participants": [],
         "unpin": unpin,
         "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "weather_sent_on_publish": False,
+        "weather_sent_on_expiry": False
+        
     }
 
     # Добавим запись в историю (active=True)
@@ -495,6 +527,9 @@ async def create_poll(chat_id: int, command_name: str, *, by_auto=False, schedul
         "active": True,
         "pinned": pinned,
         "unpin": unpin,
+        "weather_sent_on_publish": False,
+        "weather_sent_on_expiry": False
+        
     }
     add_history_entry(entry)
 
@@ -1638,6 +1673,9 @@ async def autopoll_scheduler():
 
                             logger.info(f"[autopoll] Triggering scheduled autopoll for {cmd_name} (chat {chat_id})")
                             await create_poll(chat_id, cmd_name, by_auto=True, schedule_entry=sched)
+                            if not active_poll[chat_id]["weather_sent_on_publish"]:
+                                await send_weather(chat_id)
+                                active_poll[chat_id]["weather_sent_on_publish"] = True
                             last_autocreate[key] = date.today()
 
         except Exception as e:
