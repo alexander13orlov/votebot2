@@ -68,43 +68,6 @@ def build_poll_keyboard() -> InlineKeyboardMarkup:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def parse_time_str(t: str) -> time:
     h, m, s = [int(x) for x in t.split(":")]
     return time(hour=h, minute=m, second=s)
@@ -161,8 +124,8 @@ def load_history():
                     "pinned": bool(entry.get("pinned", False)),
                     "unpin": bool(entry.get("unpin", False)),
                     "participants": _deserialize_participants(entry.get("participants", [])),
-                    "weather_sent_on_publish": False,
-                    "weather_sent_on_expiry": False  
+                    "weather_sent_on_publish": bool(entry.get("weather_sent_on_publish", False)),
+                    "weather_sent_on_expiry": bool(entry.get("weather_sent_on_expiry", False)) 
                 }
 
                 logger.info(
@@ -188,7 +151,7 @@ async def send_weather(chat_id: int):
     now = datetime.now(tz=LOCAL_TZ)
     end_hour = 23
     hours_range = range(now.hour, end_hour + 1)
-
+    hours_range=range(19, 24)
     current_weather = await weather_client.format_current()
     forecast_text = await weather_client.format_forecast(hours=hours_range, short=True)
 
@@ -352,7 +315,7 @@ async def active_poll_updater():
                 now_utc = datetime.now(timezone.utc)
                 remaining = expires_at - timedelta(minutes=LAG) - now_utc
                 if remaining.total_seconds() <= 0 and not info.get("weather_sent_on_expiry"):
-                    await send_weather(chat_id)
+                    # await send_weather(chat_id)
                     info["weather_sent_on_expiry"] = True            
         except Exception as e:
             logger.exception("Error in active_poll_updater: %s", e)
