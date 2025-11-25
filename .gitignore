@@ -10,3 +10,5 @@ venv/
 settings.json
 polls_history.json
 ideas.txt
+test.py
+interactiv.py
