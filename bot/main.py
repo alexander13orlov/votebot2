@@ -1704,13 +1704,23 @@ async def help_cmd(message: types.Message):
 
 # Список команд, для которых есть отдельные хэндлеры
 EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5", "edit", "my_stat", "top_saber", "top_rapier", "top_open"}
- 
- # --- Универсальная функция для dense ranking ---
-def dense_ranking(users: list, count_key: str = "total", top_n: int = 5):
+
+
+# --- Статистика ---
+
+# --- Конфигурация (вынесено) ---
+DAYS_LIMIT = 60  # период учёта в днях (вместо "60" везде)
+TOP_N = 5        # сколько мест показывать по умолчанию (вместо "5" везде)
+
+from datetime import datetime, timedelta, timezone
+
+# --- Универсальная функция для dense ranking ---
+def dense_ranking(users: list, count_key: str = "total", top_n: int = TOP_N):
     """
     users: список словарей {"uid": ..., "name": ..., "total": ..., ...}
     count_key: ключ для сортировки
     top_n: сколько первых мест учитывать (с учетом равных)
+    Возвращает список пользователей с полем "place".
     """
     users_sorted = sorted(users, key=lambda x: x[count_key], reverse=True)
     ranked = []
@@ -1734,12 +1744,20 @@ def dense_ranking(users: list, count_key: str = "total", top_n: int = 5):
 
 
 # --- Общая функция для топов по типу тренировок ---
-async def compute_top_by_type(training_type: str, days_limit: int = 60):
+async def compute_top_by_type(training_type: str, days_limit: int = DAYS_LIMIT):
+    """
+    Возвращает:
+      top_list: список словарей с полями uid,name,total,place (с учётом dense ranking и TOP_N)
+      days_count: количество дат (учтённых тренировок)
+      total_unique: количество уникальных участников (uid) за период
+      first_date: самая ранняя дата учёта (date) или None
+    """
     now = datetime.now(timezone.utc)
     since_dt = now - timedelta(days=days_limit)
 
     stats = {}  # uid -> {"name": str, "count": int}
     day_attendance = {}  # date -> set(uids)
+    first_date = None
 
     for entry in history:
         try:
@@ -1751,7 +1769,6 @@ async def compute_top_by_type(training_type: str, days_limit: int = 60):
                 continue
 
             expires_dt = datetime.fromisoformat(expires_str)
-            quorum = entry.get("quorum", False)
             if expires_dt < since_dt:
                 continue
 
@@ -1761,9 +1778,14 @@ async def compute_top_by_type(training_type: str, days_limit: int = 60):
 
             participants = entry.get("participants", [])
             training_date = expires_dt.date()
+            quorum = entry.get("quorum", False)
 
+            # условие учёта: quorum True ИЛИ len(participants) >= 4
             if not quorum and len(participants) < 4:
                 continue
+
+            if first_date is None or training_date < first_date:
+                first_date = training_date
 
             if training_date not in day_attendance:
                 day_attendance[training_date] = set()
@@ -1780,6 +1802,7 @@ async def compute_top_by_type(training_type: str, days_limit: int = 60):
                 if uid not in stats:
                     stats[uid] = {"name": name, "count": 0}
 
+                # обновляем имя, если есть
                 if name:
                     stats[uid]["name"] = name
 
@@ -1791,21 +1814,26 @@ async def compute_top_by_type(training_type: str, days_limit: int = 60):
         except Exception as e:
             logger.warning(f"Error in compute_top_by_type({training_type}): {e}")
 
-    users = [{"uid": uid, "name": data["name"], "total": data["count"]} for uid, data in stats.items() if data["count"] > 0]
+    # Собираем пользователей (включаем и тех у кого count==0? — в топах учитываем только >0)
+    users = [{"uid": uid, "name": data["name"], "total": data["count"]} for uid, data in stats.items()]
 
-    top_list = dense_ranking(users, count_key="total", top_n=5)
-    return top_list, len(day_attendance)
+    # Считаем top_list с dense ranking
+    top_list = dense_ranking([u for u in users if u["total"] > 0], count_key="total", top_n=TOP_N)
+
+    days_count = len(day_attendance)
+    total_unique = len(stats)  # количество уникальных участников, участвовавших в расчёте
+    return top_list, days_count, total_unique, first_date
 
 
+# --- /top5 (общий топ) ---
 @dp.message(Command(commands=["top5"]))
 async def top5_cmd(message: Message):
     now = datetime.now(timezone.utc)
-    two_months_ago = now - timedelta(days=60)
+    since_dt = now - timedelta(days=DAYS_LIMIT)
 
-    # Статистика по пользователям
-    # uid -> {"name": str, "total": int, "saber": int, "rapier": int, "open": int}
-    stats = {}
+    stats = {}  # uid -> {"name": str, "total": int, "saber": int, "rapier": int, "open": int}
     day_attendance = {}  # date -> set(uids)
+    first_date = None
 
     for entry in history:
         try:
@@ -1817,16 +1845,19 @@ async def top5_cmd(message: Message):
                 continue
 
             expires_dt = datetime.fromisoformat(expires_str)
-            quorum = entry.get("quorum", False)
-            if expires_dt < two_months_ago:
+            if expires_dt < since_dt:
                 continue
 
             participants = entry.get("participants", [])
             command = entry.get("command", "")
             training_date = expires_dt.date()
+            quorum = entry.get("quorum", False)
 
             if not quorum and len(participants) < 4:
                 continue
+
+            if first_date is None or training_date < first_date:
+                first_date = training_date
 
             if training_date not in day_attendance:
                 day_attendance[training_date] = set()
@@ -1846,11 +1877,10 @@ async def top5_cmd(message: Message):
                 if name:
                     stats[uid]["name"] = name
 
-                # Учитываем посещение один раз в день
+                # учитываем один раз в день
                 if uid not in day_attendance[training_date]:
                     day_attendance[training_date].add(uid)
                     stats[uid]["total"] += 1
-
                     if command == "saber":
                         stats[uid]["saber"] += 1
                     elif command == "rapier":
@@ -1862,6 +1892,7 @@ async def top5_cmd(message: Message):
             logger.warning(f"Error in top5: {e}")
             continue
 
+    # users — все уникальные участники с их total (включая тех с 0 если нужны — тут только >0)
     users = [
         {"uid": uid,
          "name": data["name"],
@@ -1870,47 +1901,46 @@ async def top5_cmd(message: Message):
          "rapier": data["rapier"],
          "open": data["open"]}
         for uid, data in stats.items()
-        if data["total"] > 0
     ]
 
+    # если нет ни одного пользователя
     if not users:
-        await message.answer("Нет учтённых тренировок за последние 60 дней.")
+        await message.answer(f"Нет учтённых тренировок за последние {DAYS_LIMIT} дней.")
         return
 
-    # --- Dense ranking по total ---
-    users.sort(key=lambda x: x["total"], reverse=True)
+    # --- Dense ranking по total (используем TOP_N) ---
+    users_sorted = sorted(users, key=lambda x: x["total"], reverse=True)
     ranked = []
     last_count = None
     current_place = 0
-    for u in users:
+    for u in users_sorted:
         if u["total"] != last_count:
             current_place += 1
             last_count = u["total"]
         ranked.append({"place": current_place, **u})
 
-    # Берём всех, кто в топ-5 местах (с учётом равных)
+    # Берём всех, кто входит в TOP_N мест (с учётом равных)
     max_place = 0
     for r in ranked:
-        if r["place"] <= 5:
+        if r["place"] <= TOP_N:
             max_place = max(max_place, r["place"])
     top_list = [r for r in ranked if r["place"] <= max_place]
 
-    # --- Формируем вывод ---
-    lines = ["🏆 <b>ТОП участников (последние 60 дней):</b>\n"]
+    # --- Формируем вывод (стиль оставлен тот же) ---
+    lines = [f"🏆 <b>ТОП участников (последние {DAYS_LIMIT} дней):</b>\n"]
 
     for u in top_list:
         place = u["place"]
         medal = "🥇" if place == 1 else "🥈" if place == 2 else "🥉" if place == 3 else f"{place} место"
-        lines.append(
-            f"{medal} — {u['name']}\n"
-            f"   • Всего: {u['total']}\n"
-            f"   • Сабля: {u['saber']}\n"
-            f"   • Рапира: {u['rapier']}\n"
-            f"   • Самоподготовка: {u['open']}\n"
-        )
+        lines.append(f"{medal} — {u['name']} ({u['total']} трен.)")
+        # если хочешь детализацию по видам — можно раскомментировать формат ниже
+        # lines.append(f"{medal} — {u['name']}\n   • Всего: {u['total']}\n   • Сабля: {u['saber']}\n   • Рапира: {u['rapier']}\n   • Самоподготовка: {u['open']}")
 
-    lines.append(f"\nУчтено тренировок: {len(day_attendance)}")
-    # lines.append("Условие: ≥4 участника или quorum=true")
+    total_participants = len(stats)  # уникальных участников в периоде
+    lines.append(f"\n📌 Учтено тренировок: {len(day_attendance)}")
+    lines.append(f"👥 Всего участников: {total_participants}")
+    if first_date:
+        lines.append(f"🗓 Учет ведется с {first_date.strftime('%d.%m.%Y')}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -1918,22 +1948,21 @@ async def top5_cmd(message: Message):
 # --- /top_saber ---
 @dp.message(Command(commands=["top_saber"]))
 async def top_saber_cmd(message: Message):
-    top_list, days = await compute_top_by_type("saber")
+    top_list, days, total_unique, first_date = await compute_top_by_type("saber")
 
     if not top_list:
-        await message.answer("Нет сабельных тренировок за последние 60 дней.")
+        await message.answer(f"Нет сабельных тренировок за последние {DAYS_LIMIT} дней.")
         return
 
-    lines = ["⚔️ <b>ТОП саблистов (60 дней)</b>:\n"]
+    lines = [f"⚔️ <b>ТОП саблистов ({DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
-        medal = "🥇" if u["place"] == 1 else \
-                "🥈" if u["place"] == 2 else \
-                "🥉" if u["place"] == 3 else \
-                f"{u['place']} место"
+        medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
 
-    lines.append(f"\nУчтено тренировок: {days}")
-    # lines.append("Условие: ≥4 участника или quorum=true")
+    lines.append(f"\n📌 Учтено тренировок: {days}")
+    lines.append(f"👥 Всего участников: {total_unique}")
+    if first_date:
+        lines.append(f"🗓 Учет ведется с {first_date.strftime('%d.%m.%Y')}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -1941,22 +1970,21 @@ async def top_saber_cmd(message: Message):
 # --- /top_rapier ---
 @dp.message(Command(commands=["top_rapier"]))
 async def top_rapier_cmd(message: Message):
-    top_list, days = await compute_top_by_type("rapier")
+    top_list, days, total_unique, first_date = await compute_top_by_type("rapier")
 
     if not top_list:
-        await message.answer("Нет рапирных тренировок за последние 60 дней.")
+        await message.answer(f"Нет рапирных тренировок за последние {DAYS_LIMIT} дней.")
         return
 
-    lines = ["🤺 <b>ТОП рапиристов (60 дней)</b>:\n"]
+    lines = [f"🤺 <b>ТОП рапиристов ({DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
-        medal = "🥇" if u["place"] == 1 else \
-                "🥈" if u["place"] == 2 else \
-                "🥉" if u["place"] == 3 else \
-                f"{u['place']} место"
+        medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
 
-    lines.append(f"\nУчтено тренировок: {days}")
-    # lines.append("Условие: ≥4 участника или quorum=true")
+    lines.append(f"\n📌 Учтено тренировок: {days}")
+    lines.append(f"👥 Всего участников: {total_unique}")
+    if first_date:
+        lines.append(f"🗓 Учет ведется с {first_date.strftime('%d.%m.%Y')}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -1964,22 +1992,21 @@ async def top_rapier_cmd(message: Message):
 # --- /top_open ---
 @dp.message(Command(commands=["top_open"]))
 async def top_open_cmd(message: Message):
-    top_list, days = await compute_top_by_type("openfight")
+    top_list, days, total_unique, first_date = await compute_top_by_type("openfight")
 
     if not top_list:
-        await message.answer("Нет тренировок самоподготовки за последние 60 дней.")
+        await message.answer(f"Нет тренировок самоподготовки за последние {DAYS_LIMIT} дней.")
         return
 
-    lines = ["🥊 <b>ТОП по самоподготовке (60 дней)</b>:\n"]
+    lines = [f"🥊 <b>ТОП по самоподготовке ({DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
-        medal = "🥇" if u["place"] == 1 else \
-                "🥈" if u["place"] == 2 else \
-                "🥉" if u["place"] == 3 else \
-                f"{u['place']} место"
+        medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
 
-    lines.append(f"\nУчтено тренировок: {days}")
-    # lines.append("Условие: ≥4 участника или quorum=true")
+    lines.append(f"\n📌 Учтено тренировок: {days}")
+    lines.append(f"👥 Всего участников: {total_unique}")
+    if first_date:
+        lines.append(f"🗓 Учет ведется с {first_date.strftime('%d.%m.%Y')}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -1989,17 +2016,19 @@ async def top_open_cmd(message: Message):
 async def my_stat_cmd(message: Message):
     user_id = message.from_user.id
     now = datetime.now(timezone.utc)
-    two_months_ago = now - timedelta(days=60)
+    since_dt = now - timedelta(days=DAYS_LIMIT)
 
-    my_total = 0
-    my_saber = 0
-    my_rapier = 0
-    my_open = 0
-    last_seen = None
+    # Общая статистика (учёт как раньше)
+    full_stats = {}   # uid -> total count
+    day_attendance = {}  # date -> set(uids)
+    first_date = None
 
-    full_stats = {}
-    day_attendance = {}
+    # Дополнительно собираем подсчеты по типам
+    stats_saber = {}
+    stats_rapier = {}
+    stats_open = {}
 
+    # Считаем totals и по-типы (учитываем uniq per day)
     for entry in history:
         try:
             if entry.get("active", False):
@@ -2010,20 +2039,24 @@ async def my_stat_cmd(message: Message):
                 continue
 
             expires_dt = datetime.fromisoformat(expires_str)
-            quorum = entry.get("quorum", False)
-            if expires_dt < two_months_ago:
+            if expires_dt < since_dt:
                 continue
 
             participants = entry.get("participants", [])
             command = entry.get("command", "")
             training_date = expires_dt.date()
+            quorum = entry.get("quorum", False)
 
             if not quorum and len(participants) < 4:
                 continue
 
+            if first_date is None or training_date < first_date:
+                first_date = training_date
+
             if training_date not in day_attendance:
                 day_attendance[training_date] = set()
 
+            # один проход по участникам
             for p in participants:
                 uid = p.get("uid")
                 if not uid:
@@ -2031,35 +2064,38 @@ async def my_stat_cmd(message: Message):
 
                 if uid not in full_stats:
                     full_stats[uid] = 0
-
                 if uid not in day_attendance[training_date]:
                     day_attendance[training_date].add(uid)
                     full_stats[uid] += 1
 
-                    if uid == user_id:
-                        my_total += 1
-                        if command == "saber":
-                            my_saber += 1
-                        elif command == "rapier":
-                            my_rapier += 1
-                        elif command == "openfight":
-                            my_open += 1
-                        last_seen = expires_dt
+                # по типам — считаем аналогично: 1 в день
+                if command == "saber":
+                    if training_date not in stats_saber:
+                        stats_saber[training_date] = set()
+                    stats_saber[training_date].add(uid)
+                elif command == "rapier":
+                    if training_date not in stats_rapier:
+                        stats_rapier[training_date] = set()
+                    stats_rapier[training_date].add(uid)
+                elif command == "openfight":
+                    if training_date not in stats_open:
+                        stats_open[training_date] = set()
+                    stats_open[training_date].add(uid)
 
         except Exception as e:
             logger.warning(f"Error in my_stat: {e}")
             continue
 
-    if user_id not in full_stats or full_stats[user_id] == 0:
-        await message.answer("У вас пока нет учтённых тренировок за последние 60 дней.")
+    total_users = len(full_stats)
+    if user_id not in full_stats or full_stats.get(user_id, 0) == 0:
+        await message.answer(f"У вас пока нет учтённых тренировок за последние {DAYS_LIMIT} дней.")
         return
 
-    # ---- Вычисляем место пользователя (dense ranking) ----
+    # ---- Место в общем рейтинге (dense) ----
     rating = sorted(full_stats.items(), key=lambda x: x[1], reverse=True)
-    total_users = len(rating)
     last_count = None
     place_counter = 0
-    my_place = 0
+    my_place = None
     for uid, count in rating:
         if count != last_count:
             place_counter += 1
@@ -2068,29 +2104,120 @@ async def my_stat_cmd(message: Message):
             my_place = place_counter
             break
 
-    medal = "🥇" if my_place == 1 else "🥈" if my_place == 2 else "🥉" if my_place == 3 else f"{my_place} место"
+    # --- Места по типам (saber, rapier, openfight) ---
+    # Сначала преобразуем per-date sets в пер-user total counts (uniq per day was already enforced)
+    per_user_saber = {}
+    for date, s in stats_saber.items():
+        for uid in s:
+            per_user_saber[uid] = per_user_saber.get(uid, 0) + 1
 
+    per_user_rapier = {}
+    for date, s in stats_rapier.items():
+        for uid in s:
+            per_user_rapier[uid] = per_user_rapier.get(uid, 0) + 1
+
+    per_user_open = {}
+    for date, s in stats_open.items():
+        for uid in s:
+            per_user_open[uid] = per_user_open.get(uid, 0) + 1
+
+    # helper для вычисления места (dense), при отсутствии у пользователя записей — ставим последнее место (len of rating)
+    def compute_dense_place(per_user_counts: dict, target_uid: int, all_uids: list):
+        # all_uids — список всех uid, участвовавших в общем расчёте (чтобы пользователю с 0 дать место = len(all_uids))
+        if not per_user_counts:
+            # никто не участвовал в этом типе — все места = last
+            return len(all_uids)
+        items = sorted(per_user_counts.items(), key=lambda x: x[1], reverse=True)
+        last_count_local = None
+        place_local = 0
+        for uid, cnt in items:
+            if cnt != last_count_local:
+                place_local += 1
+                last_count_local = cnt
+            if uid == target_uid:
+                return place_local
+        # если пользователя нет в per_user_counts => 0 посещений в этом типе => ему место = last (последняя)
+        return len(all_uids)
+
+    all_uids_list = list(full_stats.keys())
+
+    place_saber = compute_dense_place(per_user_saber, user_id, all_uids_list)
+    place_rapier = compute_dense_place(per_user_rapier, user_id, all_uids_list)
+    place_open = compute_dense_place(per_user_open, user_id, all_uids_list)
+
+    # подсчёт по типам для вывода (количество посещений)
+    my_saber = per_user_saber.get(user_id, 0)
+    my_rapier = per_user_rapier.get(user_id, 0)
+    my_open = per_user_open.get(user_id, 0)
+    my_total = full_stats.get(user_id, 0)
+
+    # формируем медали/текст
+    def place_to_medal(place):
+        if place == 1:
+            return "🥇"
+        if place == 2:
+            return "🥈"
+        if place == 3:
+            return "🥉"
+        return f"{place} место"
+
+    medal_general = place_to_medal(my_place)
+    medal_saber = place_to_medal(place_saber)
+    medal_rapier = place_to_medal(place_rapier)
+    medal_open = place_to_medal(place_open)
+
+    # Вывод в стиле, который был у тебя
     lines = [
-        f"📊 <b>Ваша статистика за последние 60 дней:</b>\n",
+        f"📊 <b>Ваша статистика за последние {DAYS_LIMIT} дней:</b>\n",
         f"👤 <b>{message.from_user.full_name}</b>",
-        f"🏆 Место в общем рейтинге: <b>{medal}</b> из <b>{total_users}</b>\n",
+        f"🏆 <b>{medal_general}</b> место в общем рейтинге из <b>{total_users}</b>\n",
         f"📅 Всего тренировок: <b>{my_total}</b>",
-        f"   • Сабля: {my_saber}",
-        f"   • Рапира: {my_rapier}",
-        f"   • Самоподготовка: {my_open}"
+        f"   • Сабля: {my_saber} ({medal_saber})",
+        f"   • Рапира: {my_rapier} ({medal_rapier})",
+        f"   • Самоподготовка: {my_open} ({medal_open})"
     ]
+
+    # Учтено начиная с — если есть last_seen (последний раз юзер был в списке), используем его; иначе — first_date
+    # На случай, если хочешь последний визит: найдём последний expires_dt для этого пользователя
+    last_seen = None
+    for entry in reversed(history):
+        try:
+            expires_str = entry.get("expires_at")
+            if not expires_str:
+                continue
+            expires_dt = datetime.fromisoformat(expires_str)
+            if expires_dt < since_dt:
+                continue
+            participants = entry.get("participants", [])
+            for p in participants:
+                if p.get("uid") == user_id:
+                    last_seen = expires_dt
+                    break
+            if last_seen:
+                break
+        except Exception:
+            continue
 
     if last_seen:
         local_time = last_seen.astimezone()
         lines.append(f"🕒 Учтено начиная с {local_time.strftime('%d.%m.%Y')}")
+    elif first_date:
+        lines.append(f"🕒 Учтено начиная с {first_date.strftime('%d.%m.%Y')}")
     else:
         lines.append("🕒 Учтено начиная с: нет данных")
 
-    lines.append(f"\n📌 Учитываются опросы с ≥4 участниками или где quorum = true")
+    # Нижние информационные строки (как просил)
+    lines.append(f"\n📌 Учтено тренировок: {len(day_attendance)}")
+    lines.append(f"👥 Всего участников: {total_users}")
+    if first_date:
+        lines.append(f"🗓 Учет ведется с {first_date.strftime('%d.%m.%Y')}")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
- 
+
+# --- Статистика ---
+
+
 # --- Универсальный хэндлер для ручных опросов --- #
 @dp.message(F.text.startswith("/"))
 async def universal_command_handler(message: types.Message):
