@@ -1545,6 +1545,18 @@ async def stat_callback_handler(callback: CallbackQuery):
 
 @dp.message(Command(commands=["deactivate"]))
 async def deactivate_cmd(message: Message):
+    # Проверяем права админа
+    user_id = str(message.from_user.id)
+    if user_id not in ADMIN_IDS:
+        try:
+            await message.reply("Команда доступна для администратора")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+        return    
+    
     chat_id = message.chat.id
     res = await deactivate_poll(chat_id, reason=f"manual by {message.from_user.id}")
     try:
@@ -1646,59 +1658,35 @@ async def autopoll_scheduler():
 
         await asyncio.sleep(30)
 
-def build_help_text():
+def build_help_text_compact():
     lines = [
-        "🤖 *Бот для управления опросами*\n",
-        "*Основные команды:*"
+        "🤖 *Бот для управления опросами*",
+        "\n*Участие в опросе:*",
+        "- Используйте кнопки \"✅ Участвую\" и \"🔄 Пас\" под сообщением опроса",
+        "- Можно нажимать кнопки многократно — бот корректно обработает все действия",
+        "\n*Команды отображения статистики, работают также в личных сообщениях:*",
+        " /top5 — топ-5 самых активных участников с детализацией по видам тренировок",
+        " /top\_saber — топ участников по сабле",
+        " /top\_rapier — топ участников по рапире",
+        " /top\_open — топ участников по самоподготовке",
+        " /my\_stat — ваша персональная статистика по посещениям",
+        "\n*Команды только для админов:*",
+        " /saber — создать опрос сабли вручную",
+        " /rapier — создать опрос рапиры вручную",
+        " /openfight — создать опрос самоподготовки вручную",
+        " /deactivate — закрыть активный опрос",
+        " /stat — получить общую статистику по опросам",
+        "\n*Примечание:* бот хранит последние 100 опросов и восстанавливает активный при перезапуске"
     ]
-
-    for chat_id_str, chat_conf in SETTINGS.get("chats", {}).items():
-        lines.append(f"\n*Чат:* `{chat_id_str}`")
-        topics = chat_conf.get("topics", {})
-        topic = topics.get("root", {})
-        commands = topic.get("commands", {})
-
-        for cmd_name, cmd_conf in commands.items():
-            question = cmd_conf.get("question", cmd_name)
-            lines.append(f"/{cmd_name} - Создать опрос: \"{question}\"")
-
-            # Автопрос
-            if cmd_conf.get("autopoll", "false").lower() == "true":
-                lines.append(f"   - Автопрос включён")
-                aps = cmd_conf.get("autopollsettings", {})
-                schedule_list = aps.get("schedule_autopoll", [])
-                for sched in schedule_list:
-                    day = sched.get("day", "").capitalize()
-                    create_time = sched.get("createmsg")
-                    deactivate_time = sched.get("deactivatemsg")
-                    lines.append(f"     • {day}: создаётся в {create_time}, закрывается в {deactivate_time}")
-
-            # Настройки ручного опроса
-            mps = cmd_conf.get("manualpollsettings", {})
-            pin = mps.get("pin", "false").lower() == "true"
-            unpin = mps.get("unpin", "false").lower() == "true"
-            lines.append(f"   - Pin: {pin}, Unpin: {unpin}")
-
-    lines.append("\n*Участие в опросе:*")
-    lines.append("- Используйте кнопки \"✅ Участвую\" и \"🔄 Пас\" под сообщением опроса")
-    lines.append("- Нажмите \"✅ Участвую\" чтобы добавиться в список")
-    lines.append("- Нажмите \"🔄 Пас\" чтобы удалиться из списка")
-    lines.append("- Можно нажимать кнопки многократно - бот корректно обработает все действия")
-    lines.append("\n*Закрытие опроса:*")
-    lines.append("- /deactivate - закрыть активный опрос в этом чате")
-    lines.append("\n*Статистика:*")
-    lines.append("- /stat - получить статистику по опросам (только для админов)")
-    lines.append("- /top5 - топ-5 самых активных участников")
-    lines.append("\n*История:*")
-    lines.append("- Бот хранит последние 100 опросов и восстанавливает активный при перезапуске")
     return "\n".join(lines)
+
 
 @dp.message(Command(commands=["help"]))
 async def help_cmd(message: types.Message):
-    text = build_help_text()
+    text = build_help_text_compact()
     try:
         sent = await message.answer(text, parse_mode="Markdown")
-        await asyncio.sleep(100)
+        await asyncio.sleep(600)
         try:
             await sent.delete()
         except TelegramBadRequest as e:
@@ -1713,155 +1701,411 @@ async def help_cmd(message: types.Message):
             raise
 
 
-# Список команд, для которых есть отдельные хэндлеры
-EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5", "edit"}
 
+# Список команд, для которых есть отдельные хэндлеры
+EXCLUDE_COMMANDS = {"help", "deactivate", "stat", "top5", "edit", "my_stat", "top_saber", "top_rapier", "top_open"}
+ 
+ # --- Универсальная функция для dense ranking ---
+def dense_ranking(users: list, count_key: str = "total", top_n: int = 5):
+    """
+    users: список словарей {"uid": ..., "name": ..., "total": ..., ...}
+    count_key: ключ для сортировки
+    top_n: сколько первых мест учитывать (с учетом равных)
+    """
+    users_sorted = sorted(users, key=lambda x: x[count_key], reverse=True)
+    ranked = []
+    last_count = None
+    current_place = 0
+
+    for u in users_sorted:
+        if u[count_key] != last_count:
+            current_place += 1
+            last_count = u[count_key]
+        ranked.append({"place": current_place, **u})
+
+    # Берём всех, кто в первых top_n местах (с учетом равных)
+    max_place = 0
+    for r in ranked:
+        if r["place"] <= top_n:
+            max_place = max(max_place, r["place"])
+    final_list = [r for r in ranked if r["place"] <= max_place]
+
+    return final_list
+
+
+# --- Общая функция для топов по типу тренировок ---
+async def compute_top_by_type(training_type: str, days_limit: int = 60):
+    now = datetime.now(timezone.utc)
+    since_dt = now - timedelta(days=days_limit)
+
+    stats = {}  # uid -> {"name": str, "count": int}
+    day_attendance = {}  # date -> set(uids)
+
+    for entry in history:
+        try:
+            if entry.get("active", False):
+                continue
+
+            expires_str = entry.get("expires_at")
+            if not expires_str:
+                continue
+
+            expires_dt = datetime.fromisoformat(expires_str)
+            quorum = entry.get("quorum", False)
+            if expires_dt < since_dt:
+                continue
+
+            cmd = entry.get("command", "")
+            if training_type != "all" and cmd != training_type:
+                continue
+
+            participants = entry.get("participants", [])
+            training_date = expires_dt.date()
+
+            if not quorum and len(participants) < 4:
+                continue
+
+            if training_date not in day_attendance:
+                day_attendance[training_date] = set()
+
+            for p in participants:
+                uid = p.get("uid")
+                if not uid:
+                    continue
+
+                username = p.get("username") or ""
+                fullname = p.get("fullname") or ""
+                name = f"@{username}" if username else fullname
+
+                if uid not in stats:
+                    stats[uid] = {"name": name, "count": 0}
+
+                if name:
+                    stats[uid]["name"] = name
+
+                # учитываем один раз в день
+                if uid not in day_attendance[training_date]:
+                    day_attendance[training_date].add(uid)
+                    stats[uid]["count"] += 1
+
+        except Exception as e:
+            logger.warning(f"Error in compute_top_by_type({training_type}): {e}")
+
+    users = [{"uid": uid, "name": data["name"], "total": data["count"]} for uid, data in stats.items() if data["count"] > 0]
+
+    top_list = dense_ranking(users, count_key="total", top_n=5)
+    return top_list, len(day_attendance)
 
 
 @dp.message(Command(commands=["top5"]))
 async def top5_cmd(message: Message):
-    chat_id = message.chat.id
-    
-    # Проверяем, что команда вызвана в групповом чате
-    if message.chat.type not in ["group", "supergroup"]:
-        try:
-            await message.answer("Эта команда доступна только в групповых чатах.")
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e):
-                return
-            else:
-                raise
-        return
-    
-    # Проверяем права админа
-    user_id = str(message.from_user.id)
-    if user_id not in ADMIN_IDS:
-        try:
-            await message.answer("У вас нет прав для использования этой команды.")
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e):
-                return
-            else:
-                raise
-        return
-    
-    # Вычисляем дату два месяца назад
     now = datetime.now(timezone.utc)
     two_months_ago = now - timedelta(days=60)
-    
-    # Собираем статистику тренировок
-    training_days = {}  # {date: set(participant_uids)}
-    user_stats = {}     # {uid: {"count": int, "latest_name": str}}
-    
+
+    # Статистика по пользователям
+    # uid -> {"name": str, "total": int, "saber": int, "rapier": int, "open": int}
+    stats = {}
+    day_attendance = {}  # date -> set(uids)
+
     for entry in history:
         try:
-            # Пропускаем активные опросы
             if entry.get("active", False):
                 continue
-                
-            # Получаем дату тренировки из expires_at
-            expires_at_str = entry.get("expires_at")
-            if not expires_at_str:
+
+            expires_str = entry.get("expires_at")
+            if not expires_str:
                 continue
-                
-            # Парсим дату
-            expires_dt = datetime.fromisoformat(expires_at_str)
-            
-            # Фильтруем по времени (последние 2 месяца)
+
+            expires_dt = datetime.fromisoformat(expires_str)
+            quorum = entry.get("quorum", False)
             if expires_dt < two_months_ago:
                 continue
-                
-            # Получаем участников
+
             participants = entry.get("participants", [])
-            
-            # Пропускаем тренировки с менее чем 4 участниками
-            if len(participants) < 4:
-                continue
-                
-            # Дата тренировки (без времени)
+            command = entry.get("command", "")
             training_date = expires_dt.date()
-            
-            # Добавляем участников в статистику по дате
-            for participant in participants:
-                uid = participant.get("uid")
-                username = participant.get("username")
-                fullname = participant.get("fullname", "")
-                
+
+            if not quorum and len(participants) < 4:
+                continue
+
+            if training_date not in day_attendance:
+                day_attendance[training_date] = set()
+
+            for p in participants:
+                uid = p.get("uid")
                 if not uid:
                     continue
-                    
-                # Обновляем информацию о пользователе
-                if uid not in user_stats:
-                    user_stats[uid] = {"count": 0, "latest_name": ""}
-                
-                # Обновляем имя (используем последнее доступное)
-                display_name = f"@{username}" if username else fullname
-                if display_name:
-                    user_stats[uid]["latest_name"] = display_name
-                
-                # Увеличиваем счетчик тренировок
-                if training_date not in training_days:
-                    training_days[training_date] = set()
-                
-                # Если пользователь еще не учтен за эту дату
-                if uid not in training_days[training_date]:
-                    training_days[training_date].add(uid)
-                    user_stats[uid]["count"] += 1
-                    
+
+                username = p.get("username") or ""
+                fullname = p.get("fullname") or ""
+                name = f"@{username}" if username else fullname
+
+                if uid not in stats:
+                    stats[uid] = {"name": name, "total": 0, "saber": 0, "rapier": 0, "open": 0}
+
+                if name:
+                    stats[uid]["name"] = name
+
+                # Учитываем посещение один раз в день
+                if uid not in day_attendance[training_date]:
+                    day_attendance[training_date].add(uid)
+                    stats[uid]["total"] += 1
+
+                    if command == "saber":
+                        stats[uid]["saber"] += 1
+                    elif command == "rapier":
+                        stats[uid]["rapier"] += 1
+                    elif command == "openfight":
+                        stats[uid]["open"] += 1
+
         except Exception as e:
-            logger.warning(f"Error processing history entry for top5: {e}")
+            logger.warning(f"Error in top5: {e}")
             continue
-    
-    # Формируем топ-5 участников
-    top_users = []
-    for uid, stats in user_stats.items():
-        if stats["count"] > 0 and stats["latest_name"]:
-            top_users.append({
-                "name": stats["latest_name"],
-                "count": stats["count"]
-            })
-    
-    # Сортируем по количеству тренировок (по убыванию)
-    top_users.sort(key=lambda x: x["count"], reverse=True)
-    top_5 = top_users[:5]
-    
-    # Формируем сообщение с результатами
-    if not top_5:
-        try:
-            await message.answer("За последние 2 месяцев нет данных о тренировках с 4+ участниками.")
-        except TelegramBadRequest as e:
-            if "query is too old" in str(e):
-                return
-            else:
-                raise
+
+    users = [
+        {"uid": uid,
+         "name": data["name"],
+         "total": data["total"],
+         "saber": data["saber"],
+         "rapier": data["rapier"],
+         "open": data["open"]}
+        for uid, data in stats.items()
+        if data["total"] > 0
+    ]
+
+    if not users:
+        await message.answer("Нет учтённых тренировок за последние 60 дней.")
         return
-    
-    lines = ["🏆 ТОП-5 самых активных участников за последние 2 месяца:\n"]
-    
-    for i, user in enumerate(top_5, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🔸"
-        lines.append(f"{medal} {user['name']} - {user['count']} тренировок")
-    
-    lines.append(f"\nУсловия: учитываются только тренировки с 4+ участниками")
-    lines.append(f"Период: последние 2 месяца")
-    lines.append(f"Всего тренировок учтено: {len(training_days)}")
-    
-    result_text = "\n".join(lines)
-    
-    # Просто отправляем сообщение
-    try:
-        await message.answer(result_text)
-    except TelegramBadRequest as e:
-        if "query is too old" in str(e):
-            return
-        else:
-            raise
+
+    # --- Dense ranking по total ---
+    users.sort(key=lambda x: x["total"], reverse=True)
+    ranked = []
+    last_count = None
+    current_place = 0
+    for u in users:
+        if u["total"] != last_count:
+            current_place += 1
+            last_count = u["total"]
+        ranked.append({"place": current_place, **u})
+
+    # Берём всех, кто в топ-5 местах (с учётом равных)
+    max_place = 0
+    for r in ranked:
+        if r["place"] <= 5:
+            max_place = max(max_place, r["place"])
+    top_list = [r for r in ranked if r["place"] <= max_place]
+
+    # --- Формируем вывод ---
+    lines = ["🏆 <b>ТОП участников (последние 60 дней):</b>\n"]
+
+    for u in top_list:
+        place = u["place"]
+        medal = "🥇" if place == 1 else "🥈" if place == 2 else "🥉" if place == 3 else f"{place} место"
+        lines.append(
+            f"{medal} — {u['name']}\n"
+            f"   • Всего: {u['total']}\n"
+            f"   • Сабля: {u['saber']}\n"
+            f"   • Рапира: {u['rapier']}\n"
+            f"   • Самоподготовка: {u['open']}\n"
+        )
+
+    lines.append(f"\nУчтено тренировок: {len(day_attendance)}")
+    # lines.append("Условие: ≥4 участника или quorum=true")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+# --- /top_saber ---
+@dp.message(Command(commands=["top_saber"]))
+async def top_saber_cmd(message: Message):
+    top_list, days = await compute_top_by_type("saber")
 
+    if not top_list:
+        await message.answer("Нет сабельных тренировок за последние 60 дней.")
+        return
+
+    lines = ["⚔️ <b>ТОП саблистов (60 дней)</b>:\n"]
+    for u in top_list:
+        medal = "🥇" if u["place"] == 1 else \
+                "🥈" if u["place"] == 2 else \
+                "🥉" if u["place"] == 3 else \
+                f"{u['place']} место"
+        lines.append(f"{medal} — {u['name']} ({u['total']})")
+
+    lines.append(f"\nУчтено тренировок: {days}")
+    # lines.append("Условие: ≥4 участника или quorum=true")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- /top_rapier ---
+@dp.message(Command(commands=["top_rapier"]))
+async def top_rapier_cmd(message: Message):
+    top_list, days = await compute_top_by_type("rapier")
+
+    if not top_list:
+        await message.answer("Нет рапирных тренировок за последние 60 дней.")
+        return
+
+    lines = ["🤺 <b>ТОП рапиристов (60 дней)</b>:\n"]
+    for u in top_list:
+        medal = "🥇" if u["place"] == 1 else \
+                "🥈" if u["place"] == 2 else \
+                "🥉" if u["place"] == 3 else \
+                f"{u['place']} место"
+        lines.append(f"{medal} — {u['name']} ({u['total']})")
+
+    lines.append(f"\nУчтено тренировок: {days}")
+    # lines.append("Условие: ≥4 участника или quorum=true")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- /top_open ---
+@dp.message(Command(commands=["top_open"]))
+async def top_open_cmd(message: Message):
+    top_list, days = await compute_top_by_type("openfight")
+
+    if not top_list:
+        await message.answer("Нет тренировок самоподготовки за последние 60 дней.")
+        return
+
+    lines = ["🥊 <b>ТОП по самоподготовке (60 дней)</b>:\n"]
+    for u in top_list:
+        medal = "🥇" if u["place"] == 1 else \
+                "🥈" if u["place"] == 2 else \
+                "🥉" if u["place"] == 3 else \
+                f"{u['place']} место"
+        lines.append(f"{medal} — {u['name']} ({u['total']})")
+
+    lines.append(f"\nУчтено тренировок: {days}")
+    # lines.append("Условие: ≥4 участника или quorum=true")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --- /my_stat ---
+@dp.message(Command(commands=["my_stat"]))
+async def my_stat_cmd(message: Message):
+    user_id = message.from_user.id
+    now = datetime.now(timezone.utc)
+    two_months_ago = now - timedelta(days=60)
+
+    my_total = 0
+    my_saber = 0
+    my_rapier = 0
+    my_open = 0
+    last_seen = None
+
+    full_stats = {}
+    day_attendance = {}
+
+    for entry in history:
+        try:
+            if entry.get("active", False):
+                continue
+
+            expires_str = entry.get("expires_at")
+            if not expires_str:
+                continue
+
+            expires_dt = datetime.fromisoformat(expires_str)
+            quorum = entry.get("quorum", False)
+            if expires_dt < two_months_ago:
+                continue
+
+            participants = entry.get("participants", [])
+            command = entry.get("command", "")
+            training_date = expires_dt.date()
+
+            if not quorum and len(participants) < 4:
+                continue
+
+            if training_date not in day_attendance:
+                day_attendance[training_date] = set()
+
+            for p in participants:
+                uid = p.get("uid")
+                if not uid:
+                    continue
+
+                if uid not in full_stats:
+                    full_stats[uid] = 0
+
+                if uid not in day_attendance[training_date]:
+                    day_attendance[training_date].add(uid)
+                    full_stats[uid] += 1
+
+                    if uid == user_id:
+                        my_total += 1
+                        if command == "saber":
+                            my_saber += 1
+                        elif command == "rapier":
+                            my_rapier += 1
+                        elif command == "openfight":
+                            my_open += 1
+                        last_seen = expires_dt
+
+        except Exception as e:
+            logger.warning(f"Error in my_stat: {e}")
+            continue
+
+    if user_id not in full_stats or full_stats[user_id] == 0:
+        await message.answer("У вас пока нет учтённых тренировок за последние 60 дней.")
+        return
+
+    # ---- Вычисляем место пользователя (dense ranking) ----
+    rating = sorted(full_stats.items(), key=lambda x: x[1], reverse=True)
+    total_users = len(rating)
+    last_count = None
+    place_counter = 0
+    my_place = 0
+    for uid, count in rating:
+        if count != last_count:
+            place_counter += 1
+            last_count = count
+        if uid == user_id:
+            my_place = place_counter
+            break
+
+    medal = "🥇" if my_place == 1 else "🥈" if my_place == 2 else "🥉" if my_place == 3 else f"{my_place} место"
+
+    lines = [
+        f"📊 <b>Ваша статистика за последние 60 дней:</b>\n",
+        f"👤 <b>{message.from_user.full_name}</b>",
+        f"🏆 Место в общем рейтинге: <b>{medal}</b> из <b>{total_users}</b>\n",
+        f"📅 Всего тренировок: <b>{my_total}</b>",
+        f"   • Сабля: {my_saber}",
+        f"   • Рапира: {my_rapier}",
+        f"   • Самоподготовка: {my_open}"
+    ]
+
+    if last_seen:
+        local_time = last_seen.astimezone()
+        lines.append(f"🕒 Учтено начиная с {local_time.strftime('%d.%m.%Y')}")
+    else:
+        lines.append("🕒 Учтено начиная с: нет данных")
+
+    lines.append(f"\n📌 Учитываются опросы с ≥4 участниками или где quorum = true")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+ 
 # --- Универсальный хэндлер для ручных опросов --- #
 @dp.message(F.text.startswith("/"))
 async def universal_command_handler(message: types.Message):
+    
+    user_id = str(message.from_user.id)
+    if user_id not in ADMIN_IDS:
+        try:
+            await message.reply("Команда доступна для администратора")
+        except TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                return
+            else:
+                raise
+        return
+
     chat_id = message.chat.id
     text = message.text.strip()
     
