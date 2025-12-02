@@ -1689,7 +1689,7 @@ AS_OF_DATE: datetime | None = None  # <-- сюда можно поставить
 
 # --- Dense ranking ---
 def dense_ranking(users: list, count_key: str = "total", top_n: int = TOP_N):
-    users_sorted = sorted(users, key=lambda x: [count_key], reverse=True)
+    users_sorted = sorted(users, key=lambda x: x[count_key], reverse=True)
     ranked = []
     last_count = None
     current_place = 0
