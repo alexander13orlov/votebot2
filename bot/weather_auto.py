@@ -15,7 +15,8 @@ UPDATE_INTERVAL_MIN = 10
 STOP_UPDATE_HOUR = 23
 
 # === файл для хранения сообщений ===
-WEATHER_FILE = Path("weather_messages.json")
+# WEATHER_FILE = Path("weather_messages.json")
+WEATHER_FILE = Path(__file__).parent / "weather_messages.json"
 
 # структура: chat_id -> {message_id, created_date, last_text}
 weather_messages = {}
