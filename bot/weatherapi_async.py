@@ -2,6 +2,7 @@
 import aiohttp
 import time
 from typing import Dict, Optional, Iterable, List
+from datetime import datetime, timezone, timedelta
 
 
 WEATHERAPI_CODE_MAP = {
@@ -90,9 +91,10 @@ class WeatherAPI:
 
     async def format_current(self) -> str:
         d = await self.get_current()
-
+        now = datetime.now(timezone.utc) + timedelta(hours=3)
         return (
             f"🌤 <b>Текущая погода</b>\n"
+            f"🕒 Обновлено: {now.strftime('%Y-%m-%d %H:%M')}\n"
             f"{d['icon']} {d['text']}\n"
             f"🌡 Темп: {d['temp_c']}°C (ощущается {d['feels_c']}°C)\n"
             f"💧 Влажность: {d['humidity']}%\n"
