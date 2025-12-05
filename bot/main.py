@@ -190,11 +190,11 @@ def format_participant_line(idx: int, participant: tuple) -> str:
     fullname_escaped = html.escape(fullname)
     
     # Специальная обработка для определенного пользователя
-    if uid == 409915077:
-        username_display = 'A girl has no username'
-    else:
-        username_display = f"@{html.escape(username)}" if username else 'None'
-    
+    # if uid == 409915077:
+    #     username_display = 'A girl has no username'
+    # else:
+    #     username_display = f"@{html.escape(username)}" if username else 'None'
+    username_display = f"@{html.escape(username)}" if username else 'None'
     return f"{idx:2d}. {username_display} - {fullname_escaped}"
 
 
