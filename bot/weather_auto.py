@@ -58,9 +58,20 @@ async def send_weather(bot: Bot, chat_id: int, weather_client):
     # hours_range = range(now.hour, 24)
     hours_range = range(19, 24)
 
-    current_weather = await weather_client.format_current()
-    forecast_text = await weather_client.format_forecast(hours=hours_range, short=True)
+    try:
+        current_weather = await weather_client.format_current()
+    except Exception as e:
+        logger.error(f"Failed to load current weather: {e}")
+        current_weather = "🌤 <b>Текущая погода</b>\n⚠️ Временная ошибка получения данных"
+
+    try:
+        forecast_text = await weather_client.format_forecast(hours=hours_range, short=True)
+    except Exception as e:
+        logger.error(f"Failed to load forecast: {e}")
+        forecast_text = "📅 <b>Прогноз</b>\n⚠️ Временная ошибка получения прогноза"
+
     text = f"{current_weather}\n\n{forecast_text}"
+
 
     try:
         msg = await bot.send_message(chat_id, text, parse_mode="HTML")

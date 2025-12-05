@@ -28,3 +28,7 @@ LAT, LON = 55.759931, 37.643032
 DATA_DIR = Path(__file__).parent
 SETTINGS_PATH = DATA_DIR / "settings.json"
 HISTORY_PATH = DATA_DIR / "polls_history.json"
+# Номер чата для ручной отправки погоды
+root_chat_id = os.getenv("root_chat_id")
+if not root_chat_id:
+    raise ValueError("Не найден root_chat_id в .env")
