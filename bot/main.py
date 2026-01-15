@@ -1638,11 +1638,13 @@ def build_help_text_compact():
         "\n*Участие в опросе:*",
         "- Используйте кнопки \"✅ Участвую\" и \"❌ Пас\" под сообщением опроса",
         "- Можно нажимать кнопки многократно, но не очень быстро",
+        "\n*Расписание:*",
+        " /schedule — показать расписание тренировок",
         "\n*Команды отображения статистики, работают также в личных сообщениях:*",
         " /top\_sum — топ-5 самых активных участников за последние 60 дней",
-        " /top\_saber — топ участников по сабле",
-        " /top\_rapier — топ участников по рапире",
-        " /top\_open — топ участников по самоподготовке",
+        " /top\_saber — топ участников по посещению сабли",
+        " /top\_rapier — топ участников по посещению рапиры",
+        " /top\_open — топ участников по посещению самоподготовке",
         " /my\_stat — ваша персональная статистика по посещениям",
         "\n*Команды для администраторов:*",
         " /saber — создать опрос сабли вручную",
@@ -1820,7 +1822,7 @@ async def top_sum_cmd(message: Message):
 
     top_list = dense_ranking([u for u in users if u["total"] > 0], count_key="total", top_n=TOP_N)
 
-    lines = [f"🏆 <b>ТОП участников (последние {DAYS_LIMIT} дней):</b>\n"]
+    lines = [f"🏆 <b>ТОП участников (за последние {DAYS_LIMIT} дней):</b>\n"]
     for u in top_list:
         place = u["place"]
         medal = "🥇" if place == 1 else "🥈" if place == 2 else "🥉" if place == 3 else f"{place} место"
@@ -1841,7 +1843,7 @@ async def top_saber_cmd(message: Message):
     if not top_list:
         await message.answer(f"Нет сабельных тренировок за последние {DAYS_LIMIT} дней.")
         return
-    lines = [f"⚔️ <b>ТОП саблистов ({DAYS_LIMIT} дней)</b>:\n"]
+    lines = [f"⚔️ <b>ТОП саблистов по посещениям (за последние {DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
         medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
@@ -1858,7 +1860,7 @@ async def top_rapier_cmd(message: Message):
     if not top_list:
         await message.answer(f"Нет рапирных тренировок за последние {DAYS_LIMIT} дней.")
         return
-    lines = [f"🤺 <b>ТОП рапиристов ({DAYS_LIMIT} дней)</b>:\n"]
+    lines = [f"🤺 <b>ТОП рапиристов по посещениям (за последние {DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
         medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
@@ -1875,7 +1877,7 @@ async def top_open_cmd(message: Message):
     if not top_list:
         await message.answer(f"Нет тренировок самоподготовки за последние {DAYS_LIMIT} дней.")
         return
-    lines = [f"🥊 <b>ТОП по самоподготовке ({DAYS_LIMIT} дней)</b>:\n"]
+    lines = [f"🥊 <b>ТОП по самоподготовке (за последние {DAYS_LIMIT} дней)</b>:\n"]
     for u in top_list:
         medal = "🥇" if u["place"] == 1 else "🥈" if u["place"] == 2 else "🥉" if u["place"] == 3 else f"{u['place']} место"
         lines.append(f"{medal} — {u['name']} ({u['total']})")
@@ -2010,7 +2012,7 @@ async def my_stat_cmd(message: Message):
     lines = [
         f"📊 <b>Ваша статистика за последние {DAYS_LIMIT} дней:</b>\n",
         f"👤 <b>{message.from_user.full_name}</b>",
-        f"🏆 <b>{medal_general}</b> место в общем рейтинге из <b>{total_users}</b>\n",
+        f"🏆 <b>{medal_general}</b> место в общем рейтинге по посещениям из <b>{total_users}</b>\n",
         f"📅 Всего тренировок: <b>{my_total}</b>",
         f"   • Сабля: {my_saber} ({medal_saber})",
         f"   • Рапира: {my_rapier} ({medal_rapier})",
@@ -2023,6 +2025,68 @@ async def my_stat_cmd(message: Message):
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
+DAY_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+TRAINING_TITLES = {"saber": "Сабля", "rapier": "Рапира", "openfight": "Сампо"}
+WEEKDAYS = {"mon": "Пн", "tue": "Вт", "wed": "Ср", "thu": "Чт", "fri": "Пт", "sat": "Сб", "sun": "Вс"}
+
+def _get_target_chat_conf(message: Message) -> dict | None:
+    chats = SETTINGS.get("chats", {})
+    if not chats:
+        return None
+
+    if message.chat.type == "private":
+        return next(iter(chats.values()), None)
+
+    return chats.get(str(message.chat.id))
+
+def format_schedule_table(rows: list[tuple[str, str, str]]) -> str:
+    # rows: (day_key, training_key, "HH:MM")
+    data = [
+        (WEEKDAYS.get(day, day), TRAINING_TITLES.get(t, t), time_str)
+        for day, t, time_str in rows
+    ]
+    w_day = max(len(d) for d, _, _ in data)
+    w_tr  = max(len(t) for _, t, _ in data)
+
+    lines = [f"{d.ljust(w_day)}  {t.ljust(w_tr)}  {tm}" for d, t, tm in data]
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+@dp.message(Command("schedule"))
+async def schedule_cmd(message: Message):
+    chat_conf = _get_target_chat_conf(message)
+    if not chat_conf:
+        await message.answer("Расписание не настроено.")
+        return
+
+    commands = chat_conf.get("topics", {}).get("root", {}).get("commands", {})
+
+    rows: list[tuple[str, str, str]] = []
+    for training_key, cfg in commands.items():
+        schedule = (cfg.get("autopollsettings") or {}).get("schedule_autopoll", [])
+        for e in schedule:
+            day = (e.get("day") or "").strip().lower()
+            if day == "none":
+                continue
+            t = e.get("workoutstart")
+            if not t:
+                continue
+            hhmm = datetime.strptime(t, "%H:%M:%S").strftime("%H:%M")
+            rows.append((day, training_key, hhmm))
+
+    if not rows:
+        await message.answer("Тренировок нет.")
+        return
+
+    rows.sort(key=lambda x: (DAY_ORDER.index(x[0]) if x[0] in DAY_ORDER else 999, x[2], x[1]))
+
+    # lines = [
+    #     f"{WEEKDAYS.get(day, day)} {TRAINING_TITLES.get(training_key, training_key)} {hhmm}"
+    #     for day, training_key, hhmm in rows
+    # ]
+    # await message.answer("\n".join(lines))
+    
+    text = format_schedule_table(rows)
+    await message.answer(text, parse_mode="HTML")
 
 # --- Статистика ---
 
